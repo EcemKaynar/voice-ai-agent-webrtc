@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <title>Voice AI Agent WebRTC</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #111827;
+            color: #f9fafb;
+            margin: 0;
+            padding: 30px;
+        }
+
+        .container {
+            max-width: 1050px;
+            margin: 0 auto;
+            background: #1f2937;
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+        }
+
+        h1 {
+            margin-top: 0;
+            color: #facc15;
+        }
+
+        h3 {
+            color: #93c5fd;
+        }
+
+        p {
+            line-height: 1.5;
+        }
+
+        button {
+            border: none;
+            padding: 12px 18px;
+            border-radius: 10px;
+            margin-right: 8px;
+            margin-top: 8px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+
+        button.primary {
+            background: #22c55e;
+            color: white;
+        }
+
+        button.danger {
+            background: #ef4444;
+            color: white;
+        }
+
+        button.secondary {
+            background: #374151;
+            color: white;
+        }
+
+        #statusBox {
+            margin-top: 18px;
+            padding: 14px;
+            border-radius: 10px;
+            background: #111827;
+            border: 1px solid #374151;
+        }
+
+        #logBox {
+            margin-top: 16px;
+            padding: 14px;
+            height: 190px;
+            overflow-y: auto;
+            border-radius: 10px;
+            background: #030712;
+            border: 1px solid #374151;
+            font-family: Consolas, monospace;
+            font-size: 13px;
+            white-space: pre-wrap;
+        }
+
+        .response-card {
+            margin-top: 18px;
+            background: #111827;
+            border: 1px solid #374151;
+            border-radius: 14px;
+            padding: 16px;
+        }
+
+        .box {
+            background: #030712;
+            border: 1px solid #374151;
+            border-radius: 10px;
+            padding: 12px;
+            min-height: 24px;
+            margin-bottom: 12px;
+        }
+
+        audio {
+            width: 100%;
+            margin-top: 10px;
+        }
+
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 12px;
+        }
+
+        .metric-item {
+            background: #030712;
+            border: 1px solid #374151;
+            border-radius: 10px;
+            padding: 10px;
+            font-size: 13px;
+        }
+
+        .hint {
+            color: #d1d5db;
+            font-size: 14px;
+        }
+
+        .warning {
+            color: #fbbf24;
+            font-size: 14px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 12px;
+            font-size: 13px;
+        }
+
+        th, td {
+            border: 1px solid #374151;
+            padding: 8px;
+            vertical-align: top;
+        }
+
+        th {
+            background: #030712;
+            color: #facc15;
+        }
+
+        td {
+            background: #111827;
+        }
+
+        .small-text {
+            font-size: 12px;
+            color: #d1d5db;
+        }
+
+        .scroll-table {
+            overflow-x: auto;
+        }
+    </style>
+</head>
+
+<body>
+<div class="container">
+    <h1>Voice AI Agent WebRTC</h1>
+
+    <p>
+        WebRTC bağlantısı kurulduktan sonra doğal şekilde konuş.
+        Sistem konuşmaya başladığını algılar, sustuğunda cümleni işler.
+    </p>
+
+    <p class="hint">
+        Akış: Mikrofon → WebRTC → STT → LLM → TTS → Web audio player → SQLite metrics
+    </p>
+
+    <button class="primary" onclick="startWebRTC()">WebRTC Başlat</button>
+    <button class="danger" onclick="stopWebRTC()">Durdur</button>
+    <button class="secondary" onclick="clearLog()">Log Temizle</button>
+    <button class="secondary" onclick="loadMetrics()">Metrikleri Yenile</button>
+
+    <div id="statusBox">
+        Durum: Hazır.
+    </div>
+
+    <div class="response-card">
+        <h3>Asistan Cevabı</h3>
+
+        <p><b>Sen:</b></p>
+        <div id="transcriptBox" class="box">Henüz konuşma yok.</div>
+
+        <p><b>Asistan:</b></p>
+        <div id="answerBox" class="box">Henüz cevap yok.</div>
+
+        <audio id="assistantAudio" controls></audio>
+
+        <p class="warning">
+            Tarayıcı otomatik oynatmayı engellerse audio player üzerindeki play tuşuna bas.
+        </p>
+
+        <div class="metrics">
+            <div class="metric-item">
+                <b>Metric ID:</b>
+                <span id="metricIdBox">-</span>
+            </div>
+
+            <div class="metric-item">
+                <b>STT Latency:</b>
+                <span id="sttLatencyBox">-</span> ms
+            </div>
+
+            <div class="metric-item">
+                <b>LLM First Token:</b>
+                <span id="llmFirstTokenBox">-</span> ms
+            </div>
+
+            <div class="metric-item">
+                <b>LLM Total:</b>
+                <span id="llmTotalBox">-</span> ms
+            </div>
+
+            <div class="metric-item">
+                <b>TTS First Byte:</b>
+                <span id="ttsFirstByteBox">-</span> ms
+            </div>
+
+            <div class="metric-item">
+                <b>TTS Total:</b>
+                <span id="ttsTotalBox">-</span> ms
+            </div>
+
+            <div class="metric-item">
+                <b>Total Pipeline:</b>
+                <span id="totalPipelineBox">-</span> ms
+            </div>
+
+            <div class="metric-item">
+                <b>LLM Model:</b>
+                <span id="llmModelBox">-</span>
+            </div>
+
+            <div class="metric-item">
+                <b>TTS Voice:</b>
+                <span id="ttsVoiceBox">-</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="response-card">
+        <h3>Son Metric Kayıtları</h3>
+        <p class="hint">
+            Bu tablo SQLite içindeki son voice interaction kayıtlarını gösterir.
+        </p>
+
+        <div class="scroll-table">
+            <table>
+                <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Zaman</th>
+                    <th>Transcript</th>
+                    <th>Answer</th>
+                    <th>STT</th>
+                    <th>LLM First</th>
+                    <th>LLM Total</th>
+                    <th>TTS First</th>
+                    <th>TTS Total</th>
+                    <th>Total</th>
+                </tr>
+                </thead>
+                <tbody id="metricsTableBody">
+                <tr>
+                    <td colspan="10">Henüz metric kaydı yüklenmedi.</td>
+                </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <h3>Frontend Log</h3>
+    <div id="logBox"></div>
+</div>
+
+<script>
+    let peerConnection = null;
+    let localStream = null;
+    let latestResponseId = null;
+    let responsePollTimer = null;
+
+    const statusBox = document.getElementById("statusBox");
+    const logBox = document.getElementById("logBox");
+
+    function log(message) {
+        const now = new Date().toLocaleTimeString();
+        logBox.textContent += `[${now}] ${message}\n`;
+        logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function clearLog() {
+        logBox.textContent = "";
+    }
+
+    function shortText(text, maxLength) {
+        text = text || "";
+
+        if (text.length <= maxLength) {
+            return text;
+        }
+
+        return text.substring(0, maxLength) + "...";
+    }
+
+    async function startWebRTC() {
+        try {
+            if (peerConnection) {
+                log("Zaten aktif bir WebRTC bağlantısı var.");
+                return;
+            }
+
+            statusBox.textContent = "Durum: Mikrofon izni isteniyor...";
+            log("Mikrofon izni isteniyor.");
+
+            localStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                    channelCount: 1,
+                    sampleRate: 48000
+                },
+                video: false
+            });
+
+            log("Mikrofon izni alındı.");
+
+            peerConnection = new RTCPeerConnection();
+
+            peerConnection.onconnectionstatechange = function () {
+                log("WebRTC connection state: " + peerConnection.connectionState);
+
+                if (
+                    peerConnection.connectionState === "failed" ||
+                    peerConnection.connectionState === "closed" ||
+                    peerConnection.connectionState === "disconnected"
+                ) {
+                    statusBox.textContent = "Durum: Bağlantı kapandı.";
+                }
+            };
+
+            localStream.getTracks().forEach(function (track) {
+                peerConnection.addTrack(track, localStream);
+                log("Audio track eklendi: " + track.kind);
+            });
+
+            const offer = await peerConnection.createOffer();
+
+            await peerConnection.setLocalDescription(offer);
+
+            log("Offer oluşturuldu, backend'e gönderiliyor.");
+
+            const response = await fetch("/offer", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    sdp: peerConnection.localDescription.sdp,
+                    type: peerConnection.localDescription.type
+                })
+            });
+
+            const answer = await response.json();
+
+            await peerConnection.setRemoteDescription(answer);
+
+            statusBox.textContent = "Durum: Bağlantı kuruldu. Şimdi konuşabilirsin.";
+            log("Şimdi konuşabilirsin. Sustuktan sonra sistem cümleni işleyecek.");
+
+            startResponsePolling();
+            loadMetrics();
+
+        } catch (error) {
+            console.error(error);
+            statusBox.textContent = "Durum: Hata oluştu.";
+            log("Hata: " + error.message);
+            stopWebRTC();
+        }
+    }
+
+    function stopWebRTC() {
+        if (responsePollTimer) {
+            clearInterval(responsePollTimer);
+            responsePollTimer = null;
+        }
+
+        if (localStream) {
+            localStream.getTracks().forEach(function (track) {
+                track.stop();
+            });
+
+            localStream = null;
+        }
+
+        if (peerConnection) {
+            peerConnection.close();
+            peerConnection = null;
+        }
+
+        statusBox.textContent = "Durum: Durduruldu.";
+        log("WebRTC durduruldu.");
+    }
+
+    function startResponsePolling() {
+        if (responsePollTimer) {
+            clearInterval(responsePollTimer);
+        }
+
+        responsePollTimer = setInterval(checkLatestResponse, 1000);
+    }
+
+    async function checkLatestResponse() {
+        try {
+            const response = await fetch("/latest-response?t=" + Date.now());
+            const data = await response.json();
+
+            if (!data.has_response) {
+                return;
+            }
+
+            if (!data.id || data.id === latestResponseId) {
+                return;
+            }
+
+            latestResponseId = data.id;
+
+            const transcriptBox = document.getElementById("transcriptBox");
+            const answerBox = document.getElementById("answerBox");
+            const assistantAudio = document.getElementById("assistantAudio");
+
+            const metricIdBox = document.getElementById("metricIdBox");
+            const sttLatencyBox = document.getElementById("sttLatencyBox");
+            const llmFirstTokenBox = document.getElementById("llmFirstTokenBox");
+            const llmTotalBox = document.getElementById("llmTotalBox");
+            const ttsFirstByteBox = document.getElementById("ttsFirstByteBox");
+            const ttsTotalBox = document.getElementById("ttsTotalBox");
+            const totalPipelineBox = document.getElementById("totalPipelineBox");
+            const llmModelBox = document.getElementById("llmModelBox");
+            const ttsVoiceBox = document.getElementById("ttsVoiceBox");
+
+            transcriptBox.textContent = data.transcript || "-";
+            answerBox.textContent = data.answer || "-";
+
+            metricIdBox.textContent = data.metric_id ?? "-";
+            sttLatencyBox.textContent = data.stt_latency_ms ?? "-";
+            llmFirstTokenBox.textContent = data.llm_first_token_ms ?? "-";
+            llmTotalBox.textContent = data.llm_total_ms ?? "-";
+            ttsFirstByteBox.textContent = data.tts_first_byte_ms ?? "-";
+            ttsTotalBox.textContent = data.tts_total_ms ?? "-";
+            totalPipelineBox.textContent = data.total_pipeline_ms ?? "-";
+            llmModelBox.textContent = data.llm_model || "-";
+            ttsVoiceBox.textContent = data.tts_voice || "-";
+
+            if (data.audio_url) {
+                assistantAudio.src = data.audio_url + "?t=" + Date.now();
+
+                try {
+                    await assistantAudio.play();
+                    log("Asistan sesi otomatik oynatıldı.");
+                } catch (error) {
+                    log("Otomatik oynatma engellendi. Audio player üzerinden play tuşuna basabilirsin.");
+                    console.log(error);
+                }
+            }
+
+            log("Asistan cevabı geldi: " + (data.answer || ""));
+
+            loadMetrics();
+
+        } catch (error) {
+            console.log("Latest response alınamadı:", error);
+        }
+    }
+
+    async function loadMetrics() {
+        try {
+            const response = await fetch("/metrics?limit=10&t=" + Date.now());
+            const data = await response.json();
+
+            const tbody = document.getElementById("metricsTableBody");
+            tbody.innerHTML = "";
+
+            if (!data.items || data.items.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="10">Henüz metric kaydı yok.</td></tr>';
+                return;
+            }
+
+            data.items.forEach(function (item) {
+                const row = document.createElement("tr");
+
+                row.innerHTML = `
+                    <td>${item.id ?? "-"}</td>
+                    <td class="small-text">${item.created_at ?? "-"}</td>
+                    <td>${shortText(item.transcript, 80)}</td>
+                    <td>${shortText(item.answer, 100)}</td>
+                    <td>${item.stt_latency_ms ?? "-"}</td>
+                    <td>${item.llm_first_token_ms ?? "-"}</td>
+                    <td>${item.llm_total_ms ?? "-"}</td>
+                    <td>${item.tts_first_byte_ms ?? "-"}</td>
+                    <td>${item.tts_total_ms ?? "-"}</td>
+                    <td>${item.total_pipeline_ms ?? "-"}</td>
+                `;
+
+                tbody.appendChild(row);
+            });
+
+        } catch (error) {
+            console.log("Metrics alınamadı:", error);
+        }
+    }
+
+    loadMetrics();
+</script>
+</body>
+</html>

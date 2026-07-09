@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-dotenv
+requests
+aiortc
+numpy
+faster-whisper
+edge-tts
