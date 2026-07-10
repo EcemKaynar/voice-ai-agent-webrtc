@@ -150,7 +150,6 @@ def looks_like_bad_meta_answer(answer):
     if any(phrase in text for phrase in bad_phrases):
         return True
 
-    # Türkçe istenen bir botta cevap neredeyse tamamen İngilizceyse kötü say.
     turkish_chars = len(re.findall(r"[çğıöşüÇĞİÖŞÜ]", answer))
     common_turkish_words = [
         "bugün",
