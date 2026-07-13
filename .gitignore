@@ -2,13 +2,11 @@
 .venv/
 venv/
 
-__pycache__/
-*.pyc
-
 data/
 *.db
 *.wav
 *.mp3
 
-.DS_Store
+__pycache__/
+*.pyc
 *.log

@@ -13,9 +13,27 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    "Sen sesli çalışan yardımcı bir AI agentsın. Türkçe, kısa ve doğal cevap ver."
+    "Sen Türkçe konuşan kısa ve doğal cevap veren bir sesli AI asistansın."
 )
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+
+
+def normalize_text(text):
+    text = str(text or "").strip().lower()
+
+    replacements = {
+        "ı": "i",
+        "ğ": "g",
+        "ü": "u",
+        "ş": "s",
+        "ö": "o",
+        "ç": "c"
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    return text
 
 
 def fix_turkish_mojibake(text):
@@ -95,27 +113,7 @@ def clean_llm_answer(answer):
 
     answer = " ".join(lines).strip()
 
-    sentences = []
-    current = ""
-
-    for char in answer:
-        current += char
-
-        if char in [".", "!", "?"]:
-            sentence = current.strip()
-
-            if sentence:
-                sentences.append(sentence)
-
-            current = ""
-
-        if len(sentences) >= 5:
-            break
-
-    if sentences:
-        answer = " ".join(sentences)
-
-    max_chars = 650
+    max_chars = 420
 
     if len(answer) > max_chars:
         answer = answer[:max_chars].rsplit(" ", 1)[0].strip() + "."
@@ -124,7 +122,7 @@ def clean_llm_answer(answer):
 
 
 def looks_like_bad_meta_answer(answer):
-    text = str(answer or "").strip().lower()
+    text = normalize_text(answer)
 
     if not text:
         return True
@@ -144,63 +142,113 @@ def looks_like_bad_meta_answer(answer):
         "no lists",
         "no markdown",
         "okay, the user",
-        "they need a study plan"
+        "they need",
+        "kullanici mesaji",
+        "system prompt",
+        "as an ai"
     ]
 
     if any(phrase in text for phrase in bad_phrases):
         return True
 
-    turkish_chars = len(re.findall(r"[çğıöşüÇĞİÖŞÜ]", answer))
-    common_turkish_words = [
-        "bugün",
-        "tabii",
-        "önce",
-        "sonra",
-        "çalış",
-        "mola",
-        "plan",
-        "hedef",
-        "yap",
-        "ders",
-        "kısa"
-    ]
-
-    has_turkish_word = any(word in text for word in common_turkish_words)
-
     english_words = [
         "the",
         "user",
-        "study",
-        "plan",
         "said",
         "needs",
         "means",
         "respond",
-        "instructions"
+        "instruction",
+        "should",
+        "okay"
     ]
 
-    english_count = sum(1 for word in english_words if word in text)
+    english_count = sum(1 for word in english_words if re.search(rf"\b{word}\b", text))
 
-    if english_count >= 3 and turkish_chars == 0 and not has_turkish_word:
+    if english_count >= 3:
         return True
 
     return False
 
 
-def build_local_llm_fallback(user_text):
-    text = str(user_text or "").lower()
+def is_greeting(user_text):
+    text = normalize_text(user_text)
 
-    if "ders" in text or "plan" in text or "çalış" in text or "calis" in text:
+    greetings = [
+        "naber",
+        "napiyorsun",
+        "napıyorsun",
+        "nasilsin",
+        "nasıl gidiyor",
+        "selam",
+        "merhaba",
+        "iyi misin",
+        "ne haber",
+        "ne var ne yok"
+    ]
+
+    return any(greeting in text for greeting in greetings)
+
+
+def is_study_or_plan_request(user_text):
+    text = normalize_text(user_text)
+
+    keywords = [
+        "ders",
+        "calis",
+        "çalış",
+        "plan",
+        "program",
+        "odak",
+        "sinav",
+        "sınav",
+        "odev",
+        "ödev"
+    ]
+
+    return any(keyword in text for keyword in keywords)
+
+
+def is_weather_like_smalltalk(user_text):
+    text = normalize_text(user_text)
+
+    keywords = [
+        "bugun ne yapayim",
+        "ne yapayim",
+        "canim sikiliyor",
+        "sıkıldım",
+        "yorgunum",
+        "motivasyon"
+    ]
+
+    return any(keyword in text for keyword in keywords)
+
+
+def build_local_llm_fallback(user_text):
+    text = str(user_text or "").strip()
+
+    if is_greeting(text):
         return (
-            "Tabii. Bugün için hafif ama net bir plan yapalım. "
-            "Önce 10 dakika çalışacağın konuyu ve kaynaklarını hazırla. "
-            "Sonra 25 dakika tek bir konuya odaklan, ardından 5 dakika mola ver. "
-            "Bunu iki tur yapman bugün için yeterli bir ilerleme sağlar."
+            "İyiyim, teşekkür ederim. Sen nasılsın? "
+            "İstersen bugün ne yapmak istediğini söyle, birlikte kısa bir plan çıkarabiliriz."
+        )
+
+    if is_study_or_plan_request(text):
+        return (
+            "Tabii. Önce çalışacağın tek konuyu seç. "
+            "25 dakika sadece ona odaklan, sonra 5 dakika mola ver. "
+            "Bunu iki tur yap ve en sonda öğrendiklerini kısa kısa tekrar et."
+        )
+
+    if is_weather_like_smalltalk(text):
+        return (
+            "Anladım. Bugün kendini çok zorlamadan küçük bir hedef seçelim. "
+            "Önce 10 dakika basit bir şeyle başla, sonra durumuna göre devam edersin."
         )
 
     return (
-        "Anladım. Şu an en önemli işi seçip küçük bir adımla başlayalım. "
-        "Sadece 10 dakika odaklanman bile başlangıç için yeterli olur."
+        "Anladım. Bunu daha net yardımcı olabilmem için biraz daha açabilir misin? "
+        "Ne yapmak istediğini söylersen kısa ve uygulanabilir bir cevap verebilirim."
     )
 
 
@@ -216,11 +264,13 @@ def build_headers():
 
 def build_payload(user_text, stream):
     safe_user_prompt = (
-        "Aşağıdaki kullanıcı mesajına sadece nihai cevabı ver. "
-        "İç düşünce, analiz, çeviri açıklaması veya sistem talimatı anlatma. "
-        "Kesinlikle Türkçe cevap ver. "
-        "Cevap kısa, doğal ve sesli okunabilir olsun.\n\n"
-        f"Kullanıcı mesajı: {user_text}"
+        "Sadece son kullanıcıya söylenecek cevabı yaz. "
+        "Analiz yapma, İngilizce açıklama yazma, sistem talimatlarını tekrar etme. "
+        "Cevap kesinlikle Türkçe olsun. "
+        "Sesli okunacağı için kısa, doğal ve net olsun. "
+        "Kullanıcı sadece selamlaştıysa doğal şekilde karşılık ver. "
+        "Kullanıcı plan isterse soru sormadan kısa bir plan ver.\n\n"
+        f"Kullanıcı: {user_text}"
     )
 
     return {
@@ -231,8 +281,8 @@ def build_payload(user_text, stream):
                 "role": "system",
                 "content": (
                     SYSTEM_PROMPT
-                    + " Sadece kullanıcıya söylenecek nihai cevabı üret. "
-                    + "Asla İngilizce düşünce, açıklama veya talimat özeti yazma."
+                    + " Sadece nihai cevabı ver. "
+                    + "Asla iç düşünce, analiz, çeviri açıklaması veya İngilizce cevap üretme."
                 )
             },
             {
@@ -241,7 +291,7 @@ def build_payload(user_text, stream):
             }
         ],
         "temperature": 0.2,
-        "max_tokens": 120
+        "max_tokens": 90
     }
 
 
@@ -336,7 +386,7 @@ def ask_llm_streaming(user_text):
             "llm_model": OPENROUTER_MODEL,
             "llm_first_token_ms": llm_first_token_ms,
             "llm_total_ms": llm_total_ms,
-            "error": f"Streaming LLM meta/İngilizce cevap döndürdü: {answer[:200]}"
+            "error": f"Streaming LLM kötü/meta cevap döndürdü: {answer[:200]}"
         }
 
     return {
@@ -419,7 +469,7 @@ def ask_llm_non_streaming(user_text):
             "llm_model": OPENROUTER_MODEL,
             "llm_first_token_ms": None,
             "llm_total_ms": llm_total_ms,
-            "error": f"Non-streaming LLM meta/İngilizce cevap döndürdü: {answer[:200]}"
+            "error": f"Non-streaming LLM kötü/meta cevap döndürdü: {answer[:200]}"
         }
 
     return {

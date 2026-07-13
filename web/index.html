@@ -60,12 +60,32 @@
             color: white;
         }
 
+        button.record {
+            background: #2563eb;
+            color: white;
+        }
+
+        button.stop-record {
+            background: #f97316;
+            color: white;
+        }
+
         #statusBox {
             margin-top: 18px;
             padding: 14px;
             border-radius: 10px;
             background: #111827;
             border: 1px solid #374151;
+        }
+
+        #micStatusBox {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 10px;
+            background: #030712;
+            border: 1px solid #374151;
+            color: #facc15;
+            font-size: 14px;
         }
 
         #logBox {
@@ -166,21 +186,32 @@
     <h1>Voice AI Agent WebRTC</h1>
 
     <p>
-        WebRTC bağlantısı kurulduktan sonra doğal şekilde konuş.
-        Sistem konuşmaya başladığını algılar, sustuğunda cümleni işler.
+        Push-to-talk mod aktif. Önce WebRTC bağlantısını başlat, sonra konuşmak için
+        <b>Konuşmaya Başla</b> butonuna bas. Cümlen bitince <b>Konuşmayı Bitir</b> butonuna bas.
     </p>
 
     <p class="hint">
         Akış: Mikrofon → WebRTC → STT → LLM → TTS → Web audio player → SQLite metrics
     </p>
 
+    <p class="warning">
+        Bu modda mikrofon sürekli dinlemez. Böylece asistan kendi sesini veya ortam sesini daha az yanlış algılar.
+    </p>
+
     <button class="primary" onclick="startWebRTC()">WebRTC Başlat</button>
     <button class="danger" onclick="stopWebRTC()">Durdur</button>
+    <button class="record" onclick="startUserSpeaking()">Konuşmaya Başla</button>
+    <button class="stop-record" onclick="stopUserSpeaking()">Konuşmayı Bitir</button>
+    <button class="secondary" onclick="clearConversation()">Yeni Konuşma Temizle</button>
     <button class="secondary" onclick="clearLog()">Log Temizle</button>
     <button class="secondary" onclick="loadMetrics()">Metrikleri Yenile</button>
 
     <div id="statusBox">
         Durum: Hazır.
+    </div>
+
+    <div id="micStatusBox">
+        Mikrofon: Kapalı
     </div>
 
     <div class="response-card">
@@ -195,7 +226,8 @@
         <audio id="assistantAudio" controls></audio>
 
         <p class="warning">
-            Tarayıcı otomatik oynatmayı engellerse audio player üzerindeki play tuşuna bas.
+            Asistan sesi çalarken mikrofon kapalı kalır. Yeni soru sormak için tekrar
+            Konuşmaya Başla butonuna bas.
         </p>
 
         <div class="metrics">
@@ -248,9 +280,6 @@
 
     <div class="response-card">
         <h3>Son Metric Kayıtları</h3>
-        <p class="hint">
-            Bu tablo SQLite içindeki son voice interaction kayıtlarını gösterir.
-        </p>
 
         <div class="scroll-table">
             <table>
@@ -286,9 +315,14 @@
     let localStream = null;
     let latestResponseId = null;
     let responsePollTimer = null;
+    let peerId = null;
+    let userSpeaking = false;
+    let assistantPlaying = false;
 
     const statusBox = document.getElementById("statusBox");
+    const micStatusBox = document.getElementById("micStatusBox");
     const logBox = document.getElementById("logBox");
+    const assistantAudio = document.getElementById("assistantAudio");
 
     function log(message) {
         const now = new Date().toLocaleTimeString();
@@ -310,12 +344,176 @@
         return text.substring(0, maxLength) + "...";
     }
 
+    function resetUiResponse() {
+        document.getElementById("transcriptBox").textContent = "Henüz konuşma yok.";
+        document.getElementById("answerBox").textContent = "Henüz cevap yok.";
+        document.getElementById("metricIdBox").textContent = "-";
+        document.getElementById("sttLatencyBox").textContent = "-";
+        document.getElementById("llmFirstTokenBox").textContent = "-";
+        document.getElementById("llmTotalBox").textContent = "-";
+        document.getElementById("ttsFirstByteBox").textContent = "-";
+        document.getElementById("ttsTotalBox").textContent = "-";
+        document.getElementById("totalPipelineBox").textContent = "-";
+        document.getElementById("llmModelBox").textContent = "-";
+        document.getElementById("ttsVoiceBox").textContent = "-";
+
+        assistantAudio.pause();
+        assistantAudio.removeAttribute("src");
+        assistantAudio.load();
+
+        latestResponseId = null;
+    }
+
+    async function clearLatestResponseOnServer() {
+        try {
+            await fetch("/clear-latest-response", {
+                method: "POST"
+            });
+        } catch (error) {
+            console.log("Latest response temizlenemedi:", error);
+        }
+    }
+
+    async function clearConversation() {
+        resetUiResponse();
+        await clearLatestResponseOnServer();
+
+        userSpeaking = false;
+        assistantPlaying = false;
+        setMicrophoneEnabled(false, "Yeni konuşma için temizlendi.");
+        await notifyClientState(500);
+
+        log("Konuşma ekranı ve latest response temizlendi.");
+    }
+
+    function setMicrophoneEnabled(enabled, reason) {
+        if (!localStream) {
+            micStatusBox.textContent = "Mikrofon: Kapalı";
+            return;
+        }
+
+        localStream.getAudioTracks().forEach(function (track) {
+            track.enabled = enabled;
+        });
+
+        if (enabled) {
+            micStatusBox.textContent = "Mikrofon: Açık - konuşabilirsin";
+            log("Mikrofon açıldı. " + (reason || ""));
+        } else {
+            micStatusBox.textContent = "Mikrofon: Kapalı";
+            log("Mikrofon kapatıldı. " + (reason || ""));
+        }
+    }
+
+    async function notifyClientState(ignoreAudioMs) {
+        if (!peerId) {
+            return;
+        }
+
+        try {
+            await fetch("/client-state", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    peer_id: peerId,
+                    user_speaking: userSpeaking,
+                    assistant_playing: assistantPlaying,
+                    ignore_audio_ms: ignoreAudioMs || 0
+                })
+            });
+        } catch (error) {
+            console.log("Client state gönderilemedi:", error);
+        }
+    }
+
+    async function startUserSpeaking() {
+        if (!peerConnection || !localStream || !peerId) {
+            log("Önce WebRTC Başlat butonuna basmalısın.");
+            return;
+        }
+
+        if (assistantPlaying) {
+            log("Asistan sesi oynarken konuşma başlatılamaz.");
+            return;
+        }
+
+        userSpeaking = true;
+        setMicrophoneEnabled(true, "Kullanıcı konuşma başlattı.");
+        await notifyClientState(0);
+
+        statusBox.textContent = "Durum: Dinleniyor. Konuşmayı bitirince Konuşmayı Bitir butonuna bas.";
+        log("Konuşma kaydı başladı.");
+    }
+
+    async function stopUserSpeaking() {
+        if (!peerConnection || !localStream || !peerId) {
+            log("Aktif bağlantı yok.");
+            return;
+        }
+
+        userSpeaking = false;
+        setMicrophoneEnabled(false, "Kullanıcı konuşmayı bitirdi.");
+        await notifyClientState(0);
+
+        statusBox.textContent = "Durum: Konuşma bitti. Backend işliyor...";
+        log("Konuşma kaydı bitirildi, backend işleyecek.");
+    }
+
+    function setupAssistantAudioEvents() {
+        assistantAudio.addEventListener("play", async function () {
+            assistantPlaying = true;
+            userSpeaking = false;
+            setMicrophoneEnabled(false, "Asistan sesi oynuyor.");
+            await notifyClientState(0);
+        });
+
+        assistantAudio.addEventListener("playing", async function () {
+            assistantPlaying = true;
+            userSpeaking = false;
+            setMicrophoneEnabled(false, "Asistan sesi oynuyor.");
+            await notifyClientState(0);
+        });
+
+        assistantAudio.addEventListener("ended", async function () {
+            assistantPlaying = false;
+            userSpeaking = false;
+
+            setMicrophoneEnabled(false, "Asistan sesi bitti. Yeni soru için Konuşmaya Başla.");
+            await notifyClientState(900);
+
+            statusBox.textContent = "Durum: Asistan cevapladı. Yeni soru için Konuşmaya Başla.";
+        });
+
+        assistantAudio.addEventListener("pause", async function () {
+            if (assistantAudio.duration && assistantAudio.currentTime < assistantAudio.duration) {
+                return;
+            }
+
+            assistantPlaying = false;
+            userSpeaking = false;
+
+            setMicrophoneEnabled(false, "Asistan sesi durdu.");
+            await notifyClientState(900);
+        });
+    }
+
+    setupAssistantAudioEvents();
+
     async function startWebRTC() {
         try {
             if (peerConnection) {
                 log("Zaten aktif bir WebRTC bağlantısı var.");
                 return;
             }
+
+            resetUiResponse();
+            await clearLatestResponseOnServer();
+
+            userSpeaking = false;
+            assistantPlaying = false;
+            peerId = null;
 
             statusBox.textContent = "Durum: Mikrofon izni isteniyor...";
             log("Mikrofon izni isteniyor.");
@@ -332,6 +530,8 @@
             });
 
             log("Mikrofon izni alındı.");
+
+            setMicrophoneEnabled(false, "Push-to-talk bekleme modu.");
 
             peerConnection = new RTCPeerConnection();
 
@@ -371,10 +571,20 @@
 
             const answer = await response.json();
 
-            await peerConnection.setRemoteDescription(answer);
+            peerId = answer.peer_id || null;
 
-            statusBox.textContent = "Durum: Bağlantı kuruldu. Şimdi konuşabilirsin.";
-            log("Şimdi konuşabilirsin. Sustuktan sonra sistem cümleni işleyecek.");
+            await peerConnection.setRemoteDescription({
+                sdp: answer.sdp,
+                type: answer.type
+            });
+
+            statusBox.textContent = "Durum: Bağlantı kuruldu. Konuşmak için Konuşmaya Başla.";
+            log("Bağlantı kuruldu. Konuşmak için Konuşmaya Başla butonuna bas.");
+
+            userSpeaking = false;
+            assistantPlaying = false;
+            setMicrophoneEnabled(false, "Bağlantı kuruldu, konuşma bekleniyor.");
+            await notifyClientState(500);
 
             startResponsePolling();
             loadMetrics();
@@ -406,6 +616,11 @@
             peerConnection = null;
         }
 
+        userSpeaking = false;
+        assistantPlaying = false;
+        peerId = null;
+
+        micStatusBox.textContent = "Mikrofon: Kapalı";
         statusBox.textContent = "Durum: Durduruldu.";
         log("WebRTC durduruldu.");
     }
@@ -433,34 +648,25 @@
 
             latestResponseId = data.id;
 
-            const transcriptBox = document.getElementById("transcriptBox");
-            const answerBox = document.getElementById("answerBox");
-            const assistantAudio = document.getElementById("assistantAudio");
+            document.getElementById("transcriptBox").textContent = data.transcript || "-";
+            document.getElementById("answerBox").textContent = data.answer || "-";
 
-            const metricIdBox = document.getElementById("metricIdBox");
-            const sttLatencyBox = document.getElementById("sttLatencyBox");
-            const llmFirstTokenBox = document.getElementById("llmFirstTokenBox");
-            const llmTotalBox = document.getElementById("llmTotalBox");
-            const ttsFirstByteBox = document.getElementById("ttsFirstByteBox");
-            const ttsTotalBox = document.getElementById("ttsTotalBox");
-            const totalPipelineBox = document.getElementById("totalPipelineBox");
-            const llmModelBox = document.getElementById("llmModelBox");
-            const ttsVoiceBox = document.getElementById("ttsVoiceBox");
-
-            transcriptBox.textContent = data.transcript || "-";
-            answerBox.textContent = data.answer || "-";
-
-            metricIdBox.textContent = data.metric_id ?? "-";
-            sttLatencyBox.textContent = data.stt_latency_ms ?? "-";
-            llmFirstTokenBox.textContent = data.llm_first_token_ms ?? "-";
-            llmTotalBox.textContent = data.llm_total_ms ?? "-";
-            ttsFirstByteBox.textContent = data.tts_first_byte_ms ?? "-";
-            ttsTotalBox.textContent = data.tts_total_ms ?? "-";
-            totalPipelineBox.textContent = data.total_pipeline_ms ?? "-";
-            llmModelBox.textContent = data.llm_model || "-";
-            ttsVoiceBox.textContent = data.tts_voice || "-";
+            document.getElementById("metricIdBox").textContent = data.metric_id ?? "-";
+            document.getElementById("sttLatencyBox").textContent = data.stt_latency_ms ?? "-";
+            document.getElementById("llmFirstTokenBox").textContent = data.llm_first_token_ms ?? "-";
+            document.getElementById("llmTotalBox").textContent = data.llm_total_ms ?? "-";
+            document.getElementById("ttsFirstByteBox").textContent = data.tts_first_byte_ms ?? "-";
+            document.getElementById("ttsTotalBox").textContent = data.tts_total_ms ?? "-";
+            document.getElementById("totalPipelineBox").textContent = data.total_pipeline_ms ?? "-";
+            document.getElementById("llmModelBox").textContent = data.llm_model || "-";
+            document.getElementById("ttsVoiceBox").textContent = data.tts_voice || "-";
 
             if (data.audio_url) {
+                userSpeaking = false;
+                assistantPlaying = true;
+                setMicrophoneEnabled(false, "Yeni asistan sesi geldi.");
+                await notifyClientState(0);
+
                 assistantAudio.src = data.audio_url + "?t=" + Date.now();
 
                 try {
@@ -469,9 +675,15 @@
                 } catch (error) {
                     log("Otomatik oynatma engellendi. Audio player üzerinden play tuşuna basabilirsin.");
                     console.log(error);
+
+                    assistantPlaying = false;
+                    userSpeaking = false;
+                    setMicrophoneEnabled(false, "Otomatik oynatma başlamadı.");
+                    await notifyClientState(900);
                 }
             }
 
+            statusBox.textContent = "Durum: Asistan cevapladı. Yeni soru için Konuşmaya Başla.";
             log("Asistan cevabı geldi: " + (data.answer || ""));
 
             loadMetrics();
@@ -518,7 +730,11 @@
         }
     }
 
-    loadMetrics();
+    window.addEventListener("load", async function () {
+        resetUiResponse();
+        await clearLatestResponseOnServer();
+        loadMetrics();
+    });
 </script>
 </body>
 </html>
