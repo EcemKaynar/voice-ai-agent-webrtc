@@ -7,7 +7,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -34,14 +34,17 @@ from services.stt_service import (
 )
 
 from services.llm_service import ask_llm_with_metrics
-from services.tts_service import synthesize_speech_with_metrics
+
+from services.tts_service import (
+    stream_tts_audio_chunks,
+    get_tts_config
+)
 
 
 load_dotenv()
 
 APP_NAME = os.getenv("APP_NAME", "Voice AI Agent WebRTC")
 
-AUDIO_CHUNK_SECONDS = float(os.getenv("AUDIO_CHUNK_SECONDS", "10"))
 AUDIO_OUTPUT_DIR = os.getenv("AUDIO_OUTPUT_DIR", "data/audio_chunks")
 MIN_AUDIO_RMS = float(os.getenv("MIN_AUDIO_RMS", "80"))
 TARGET_SAMPLE_RATE = int(os.getenv("TARGET_SAMPLE_RATE", "16000"))
@@ -76,6 +79,8 @@ latest_response = {
     "has_response": False
 }
 
+pending_tts_streams = {}
+
 client_states = {}
 
 runtime_state = {
@@ -92,7 +97,7 @@ class OfferRequest(BaseModel):
 
 class ClientStateRequest(BaseModel):
     peer_id: str
-    user_speaking: bool = False
+    user_speaking: bool = True
     assistant_playing: bool = False
     ignore_audio_ms: int = 0
 
@@ -107,8 +112,21 @@ def make_audio_filename(peer_id):
 def reset_latest_response():
     latest_response.clear()
     latest_response.update({
-        "has_response": False
+        "has_response": False,
+        "updated_at": datetime.now().isoformat(timespec="milliseconds")
     })
+
+
+def update_client_state_values(peer_id, **kwargs):
+    state = client_states.get(peer_id, {})
+
+    for key, value in kwargs.items():
+        state[key] = value
+
+    state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    client_states[peer_id] = state
+
+    return state
 
 
 def normalize_text_for_filter(text):
@@ -144,9 +162,7 @@ def should_ignore_transcript(transcript):
         "altyazi",
         "altyazi m.k",
         "altyazi m k",
-        "altyazi m k.",
         "izlediginiz icin tesekkurler",
-        "tesekkurler izlediginiz icin",
         "thank you for watching",
         "thanks for watching",
         "videonun altinda",
@@ -160,7 +176,6 @@ def should_ignore_transcript(transcript):
         "sesli betimleme dernegi",
         "trt tarafindan",
         "begenirmeyi",
-        "begenirmeyi ve begenirmeyi",
         "soguklarinizi"
     ]
 
@@ -192,30 +207,32 @@ def should_ignore_transcript(transcript):
 
 def get_streaming_config():
     return {
-        "input_mode": "push_to_talk",
+        "input_mode": "auto_turn_taking",
+        "push_to_talk_enabled": False,
         "stt_streaming_enabled": False,
-        "stt_current_mode": "push_to_talk_segment_saved_then_transcribed",
+        "stt_current_mode": "auto_silence_detected_segment_then_transcribed",
         "llm_streaming_enabled": True,
         "llm_non_streaming_fallback_enabled": True,
         "tts_backend_streaming_enabled": True,
-        "tts_frontend_streaming_enabled": False,
-        "tts_current_mode": "edge_tts_stream_saved_to_mp3_then_served_over_http",
+        "tts_frontend_streaming_enabled": True,
+        "tts_current_mode": "edge_tts_audio_chunks_streamed_with_http_streaming",
         "frontend_update_mode": "polling_latest_response_endpoint",
         "webrtc_input_audio_enabled": True,
         "webrtc_output_audio_enabled": False,
         "assistant_audio_feedback_protection": True,
         "note": (
-            "Current MVP uses WebRTC for microphone input with push-to-talk. "
-            "Backend ignores audio unless user_speaking is true. "
-            "Assistant playback also disables backend processing to avoid feedback loops."
+            "This version uses automatic turn taking. "
+            "The browser keeps the microphone track alive, but backend ignores audio "
+            "while assistant is speaking or while server is processing."
         )
     }
 
 
 def get_client_state(peer_id):
     return client_states.get(peer_id, {
-        "user_speaking": False,
+        "user_speaking": True,
         "assistant_playing": False,
+        "server_processing": False,
         "ignore_until": 0
     })
 
@@ -224,6 +241,9 @@ def is_assistant_audio_guard_active(peer_id):
     state = get_client_state(peer_id)
 
     if state.get("assistant_playing"):
+        return True
+
+    if state.get("server_processing"):
         return True
 
     ignore_until = state.get("ignore_until", 0)
@@ -252,6 +272,14 @@ async def handle_transcript_with_llm(
 
     if should_ignore_transcript(transcript):
         print(f"[{peer_id}] Transcript filtrelendi, LLM'e gönderilmeyecek: {transcript}")
+
+        update_client_state_values(
+            peer_id,
+            user_speaking=True,
+            assistant_playing=False,
+            server_processing=False
+        )
+
         return None
 
     if pipeline_started_at is None:
@@ -279,96 +307,71 @@ async def handle_transcript_with_llm(
 
     if not answer:
         print(f"[{peer_id}] LLM cevabı boş, TTS'e gönderilmeyecek.")
+
+        update_client_state_values(
+            peer_id,
+            user_speaking=True,
+            assistant_playing=False,
+            server_processing=False
+        )
+
         return llm_result
 
-    print(f"[{peer_id}] TTS'e gönderiliyor:")
-    print(f"  Text: {answer}")
+    response_id = str(uuid.uuid4())
+    audio_url = f"/tts-stream/{response_id}"
 
-    tts_result = await synthesize_speech_with_metrics(
-        text=answer,
-        peer_id=peer_id
-    )
+    pending_tts_streams[response_id] = {
+        "peer_id": peer_id,
+        "transcript": transcript,
+        "answer": answer,
+        "audio_input_path": audio_input_path,
+        "stt_result": stt_result,
+        "llm_result": llm_result,
+        "pipeline_started_at": pipeline_started_at,
+        "created_at": datetime.now().isoformat(timespec="milliseconds")
+    }
 
-    print(f"[{peer_id}] TTS sonucu:")
-    print(f"  Success: {tts_result.get('success')}")
-    print(f"  Audio path: {tts_result.get('audio_path')}")
-    print(f"  TTS voice: {tts_result.get('tts_voice')}")
-    print(f"  TTS first byte ms: {tts_result.get('tts_first_byte_ms')}")
-    print(f"  TTS total ms: {tts_result.get('tts_total_ms')}")
-
-    if tts_result.get("error"):
-        print(f"  TTS error: {tts_result.get('error')}")
-
-    total_pipeline_ms = int((time.perf_counter() - pipeline_started_at) * 1000)
-
-    audio_url = None
-
-    if tts_result.get("audio_path"):
-        audio_url = f"/tts-audio/{Path(tts_result.get('audio_path')).name}"
-
-    errors = {}
-
-    if stt_result.get("error"):
-        errors["stt_error"] = stt_result.get("error")
-
-    if llm_result.get("error"):
-        errors["llm_error"] = llm_result.get("error")
-
-    if tts_result.get("error"):
-        errors["tts_error"] = tts_result.get("error")
-
-    metric_id = save_voice_metric(
-        peer_id=peer_id,
-        transcript=transcript,
-        answer=answer,
-        audio_input_path=audio_input_path,
-        audio_output_path=tts_result.get("audio_path"),
-        stt_success=stt_result.get("success"),
-        llm_success=llm_result.get("success"),
-        tts_success=tts_result.get("success"),
-        stt_latency_ms=stt_result.get("stt_latency_ms"),
-        llm_first_token_ms=llm_result.get("llm_first_token_ms"),
-        llm_total_ms=llm_result.get("llm_total_ms"),
-        tts_first_byte_ms=tts_result.get("tts_first_byte_ms"),
-        tts_total_ms=tts_result.get("tts_total_ms"),
-        total_pipeline_ms=total_pipeline_ms,
-        llm_model=llm_result.get("llm_model"),
-        tts_voice=tts_result.get("tts_voice"),
-        errors=errors
-    )
-
-    print(f"[{peer_id}] Metric kaydedildi. Metric ID: {metric_id}")
+    print(f"[{peer_id}] TTS streaming hazırlandı.")
+    print(f"  Response ID: {response_id}")
+    print(f"  Audio stream URL: {audio_url}")
 
     latest_response.clear()
     latest_response.update({
         "has_response": True,
-        "id": str(uuid.uuid4()),
-        "metric_id": metric_id,
+        "id": response_id,
+        "metric_id": None,
         "peer_id": peer_id,
         "transcript": transcript,
         "answer": answer,
         "audio_url": audio_url,
-        "stt_llm_tts_status": "completed",
+        "stt_llm_tts_status": "tts_stream_pending",
         "stt_latency_ms": stt_result.get("stt_latency_ms"),
         "llm_first_token_ms": llm_result.get("llm_first_token_ms"),
         "llm_total_ms": llm_result.get("llm_total_ms"),
-        "tts_first_byte_ms": tts_result.get("tts_first_byte_ms"),
-        "tts_total_ms": tts_result.get("tts_total_ms"),
-        "total_pipeline_ms": total_pipeline_ms,
+        "tts_first_byte_ms": None,
+        "tts_total_ms": None,
+        "total_pipeline_ms": None,
         "llm_model": llm_result.get("llm_model"),
-        "tts_voice": tts_result.get("tts_voice"),
-        "streaming_config": get_streaming_config()
+        "tts_voice": get_tts_config().get("tts_voice"),
+        "streaming_config": get_streaming_config(),
+        "updated_at": datetime.now().isoformat(timespec="milliseconds")
     })
 
-    llm_result["tts_result"] = tts_result
-    llm_result["metric_id"] = metric_id
-    llm_result["total_pipeline_ms"] = total_pipeline_ms
+    llm_result["tts_stream_url"] = audio_url
+    llm_result["response_id"] = response_id
 
     return llm_result
 
 
 async def process_saved_wav_with_stt_and_llm(peer_id, saved_path, label="STT sonucu"):
     pipeline_started_at = time.perf_counter()
+
+    update_client_state_values(
+        peer_id,
+        user_speaking=False,
+        assistant_playing=False,
+        server_processing=True
+    )
 
     stt_result = await asyncio.to_thread(
         transcribe_audio_file,
@@ -392,6 +395,14 @@ async def process_saved_wav_with_stt_and_llm(peer_id, saved_path, label="STT son
         audio_input_path=saved_path,
         pipeline_started_at=pipeline_started_at
     )
+
+    if not isinstance(llm_tts_result, dict) or not llm_tts_result.get("response_id"):
+        update_client_state_values(
+            peer_id,
+            user_speaking=True,
+            assistant_playing=False,
+            server_processing=False
+        )
 
     return {
         "stt_result": stt_result,
@@ -418,7 +429,7 @@ async def consume_audio_track(track, peer_id):
     utterance_speech_samples = 0
 
     print(f"[{peer_id}] Audio track dinleniyor...")
-    print(f"[{peer_id}] Push-to-talk mod aktif. Konuşmaya Başla butonu bekleniyor.")
+    print(f"[{peer_id}] Auto turn-taking mod aktif. Kullanıcı konuşunca otomatik algılanacak.")
 
     def add_to_pre_speech_buffer(pcm):
         nonlocal pre_speech_samples
@@ -506,13 +517,13 @@ async def consume_audio_track(track, peer_id):
             f"Audio duration: {round(utterance_duration_seconds, 2)} sn"
         )
 
+        reset_utterance()
+
         await process_saved_wav_with_stt_and_llm(
             peer_id=peer_id,
             saved_path=saved_path,
             label="STT sonucu"
         )
-
-        reset_utterance()
 
     try:
         while True:
@@ -530,16 +541,12 @@ async def consume_audio_track(track, peer_id):
 
                 if is_assistant_audio_guard_active(peer_id):
                     if speech_active:
-                        print(f"[{peer_id}] Asistan sesi/ignore modu aktif, buffer temizlendi.")
+                        print(f"[{peer_id}] Asistan/processing guard aktif, buffer temizlendi.")
                     reset_utterance()
                     continue
 
                 if not is_user_speaking_enabled(peer_id):
-                    if speech_active and utterance_samples > 0:
-                        await process_current_utterance(reason="push_to_talk_stop")
-                    else:
-                        reset_utterance()
-
+                    reset_utterance()
                     continue
 
                 frame_rms = calculate_rms_int16([pcm])
@@ -576,6 +583,7 @@ async def consume_audio_track(track, peer_id):
                     silence_samples += len(pcm)
 
                 utterance_duration_seconds = utterance_samples / current_sample_rate
+                silence_duration_seconds = silence_samples / current_sample_rate
                 speech_duration_seconds = utterance_speech_samples / current_sample_rate
                 speech_ratio = utterance_speech_samples / max(utterance_samples, 1)
 
@@ -584,12 +592,19 @@ async def consume_audio_track(track, peer_id):
                         f"[{peer_id}] Dinleniyor. "
                         f"Frame count: {frame_count}, "
                         f"Frame RMS: {round(frame_rms, 2)}, "
-                        f"User speaking: {is_user_speaking_enabled(peer_id)}, "
                         f"Speech active: {speech_active}, "
                         f"Utterance duration: {round(utterance_duration_seconds, 2)} sn, "
                         f"Speech duration: {round(speech_duration_seconds, 2)} sn, "
-                        f"Speech ratio: {round(speech_ratio, 2)}"
+                        f"Speech ratio: {round(speech_ratio, 2)}, "
+                        f"Silence duration: {round(silence_duration_seconds, 2)} sn"
                     )
+
+                if (
+                    silence_duration_seconds >= SILENCE_END_SECONDS
+                    and utterance_duration_seconds >= MIN_UTTERANCE_SECONDS
+                ):
+                    await process_current_utterance(reason="silence_detected")
+                    continue
 
                 if utterance_duration_seconds >= MAX_UTTERANCE_SECONDS:
                     await process_current_utterance(reason="max_duration")
@@ -650,9 +665,11 @@ def health():
         "target_sample_rate": TARGET_SAMPLE_RATE,
         "min_audio_rms": MIN_AUDIO_RMS,
         "speech_rms_threshold": SPEECH_RMS_THRESHOLD,
+        "silence_end_seconds": SILENCE_END_SECONDS,
         "min_speech_seconds": MIN_SPEECH_SECONDS,
         "min_speech_ratio": MIN_SPEECH_RATIO,
-        "tts_output_dir": TTS_OUTPUT_DIR,
+        "tts_config": get_tts_config(),
+        "pending_tts_stream_count": len(pending_tts_streams),
         "client_states": client_states
     })
 
@@ -661,11 +678,12 @@ def health():
 def config():
     return JSONResponse({
         "app": APP_NAME,
-        "mode": "webrtc_push_to_talk_stt_llm_tts_metrics_mvp",
+        "mode": "webrtc_auto_turn_taking_streaming_tts_metrics_mvp",
         "audio_config": {
             "target_sample_rate": TARGET_SAMPLE_RATE,
             "min_audio_rms": MIN_AUDIO_RMS,
             "speech_rms_threshold": SPEECH_RMS_THRESHOLD,
+            "silence_end_seconds": SILENCE_END_SECONDS,
             "min_utterance_seconds": MIN_UTTERANCE_SECONDS,
             "max_utterance_seconds": MAX_UTTERANCE_SECONDS,
             "pre_speech_seconds": PRE_SPEECH_SECONDS,
@@ -673,6 +691,7 @@ def config():
             "min_speech_ratio": MIN_SPEECH_RATIO
         },
         "stt_config": get_stt_config(),
+        "tts_config": get_tts_config(),
         "streaming_config": get_streaming_config()
     })
 
@@ -680,6 +699,117 @@ def config():
 @app.get("/latest-response")
 def get_latest_response():
     return JSONResponse(latest_response)
+
+
+@app.get("/tts-stream/{response_id}")
+async def tts_stream(response_id: str):
+    stream_data = pending_tts_streams.get(response_id)
+
+    if not stream_data:
+        async def empty_stream():
+            yield b""
+
+        return StreamingResponse(
+            empty_stream(),
+            media_type="audio/mpeg"
+        )
+
+    peer_id = stream_data.get("peer_id")
+    answer = stream_data.get("answer")
+    transcript = stream_data.get("transcript")
+    stt_result = stream_data.get("stt_result") or {}
+    llm_result = stream_data.get("llm_result") or {}
+    audio_input_path = stream_data.get("audio_input_path")
+    pipeline_started_at = stream_data.get("pipeline_started_at") or time.perf_counter()
+
+    async def audio_generator():
+        tts_started_at = time.perf_counter()
+        first_byte_at = None
+        tts_success = True
+        tts_error = None
+
+        try:
+            async for audio_chunk in stream_tts_audio_chunks(answer):
+                if first_byte_at is None:
+                    first_byte_at = time.perf_counter()
+
+                    print(
+                        f"[{peer_id}] TTS stream first byte: "
+                        f"{int((first_byte_at - tts_started_at) * 1000)} ms"
+                    )
+
+                yield audio_chunk
+
+        except Exception as error:
+            tts_success = False
+            tts_error = str(error)
+            print(f"[{peer_id}] TTS stream error: {tts_error}")
+
+        finally:
+            tts_finished_at = time.perf_counter()
+
+            tts_first_byte_ms = None
+
+            if first_byte_at is not None:
+                tts_first_byte_ms = int((first_byte_at - tts_started_at) * 1000)
+
+            tts_total_ms = int((tts_finished_at - tts_started_at) * 1000)
+            total_pipeline_ms = int((tts_finished_at - pipeline_started_at) * 1000)
+
+            errors = {}
+
+            if stt_result.get("error"):
+                errors["stt_error"] = stt_result.get("error")
+
+            if llm_result.get("error"):
+                errors["llm_error"] = llm_result.get("error")
+
+            if tts_error:
+                errors["tts_error"] = tts_error
+
+            metric_id = save_voice_metric(
+                peer_id=peer_id,
+                transcript=transcript,
+                answer=answer,
+                audio_input_path=audio_input_path,
+                audio_output_path=f"/tts-stream/{response_id}",
+                stt_success=stt_result.get("success"),
+                llm_success=llm_result.get("success"),
+                tts_success=tts_success,
+                stt_latency_ms=stt_result.get("stt_latency_ms"),
+                llm_first_token_ms=llm_result.get("llm_first_token_ms"),
+                llm_total_ms=llm_result.get("llm_total_ms"),
+                tts_first_byte_ms=tts_first_byte_ms,
+                tts_total_ms=tts_total_ms,
+                total_pipeline_ms=total_pipeline_ms,
+                llm_model=llm_result.get("llm_model"),
+                tts_voice=get_tts_config().get("tts_voice"),
+                errors=errors
+            )
+
+            print(f"[{peer_id}] Streaming TTS metric kaydedildi. Metric ID: {metric_id}")
+
+            update_client_state_values(
+                peer_id,
+                server_processing=False
+            )
+
+            if latest_response.get("id") == response_id:
+                latest_response.update({
+                    "metric_id": metric_id,
+                    "stt_llm_tts_status": "tts_stream_completed",
+                    "tts_first_byte_ms": tts_first_byte_ms,
+                    "tts_total_ms": tts_total_ms,
+                    "total_pipeline_ms": total_pipeline_ms,
+                    "updated_at": datetime.now().isoformat(timespec="milliseconds")
+                })
+
+            pending_tts_streams.pop(response_id, None)
+
+    return StreamingResponse(
+        audio_generator(),
+        media_type="audio/mpeg"
+    )
 
 
 @app.post("/clear-latest-response")
@@ -704,6 +834,9 @@ def update_client_state(request: ClientStateRequest):
         state["ignore_until"] = time.time() + (request.ignore_audio_ms / 1000)
     elif not state.get("ignore_until"):
         state["ignore_until"] = 0
+
+    if "server_processing" not in state:
+        state["server_processing"] = False
 
     client_states[request.peer_id] = state
 
@@ -732,8 +865,9 @@ async def offer(request: OfferRequest):
     pcs.add(pc)
 
     client_states[peer_id] = {
-        "user_speaking": False,
+        "user_speaking": True,
         "assistant_playing": False,
+        "server_processing": False,
         "ignore_until": 0,
         "created_at": datetime.now().isoformat(timespec="seconds")
     }
@@ -784,3 +918,4 @@ async def on_shutdown():
     await asyncio.gather(*coroutines)
     pcs.clear()
     client_states.clear()
+    pending_tts_streams.clear()
