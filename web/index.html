@@ -147,6 +147,48 @@
             border: 1px solid rgba(148, 163, 184, 0.20);
         }
 
+        .mic-panel {
+            margin-top: 22px;
+            padding: 16px;
+            border-radius: 20px;
+            background: rgba(2, 6, 23, 0.42);
+            border: 1px solid var(--border-soft);
+        }
+
+        .mic-panel-title {
+            color: var(--text-muted);
+            font-size: 12px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 10px;
+        }
+
+        .mic-row {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .mic-select {
+            width: 100%;
+            border: 1px solid rgba(148, 163, 184, 0.24);
+            background: rgba(15, 23, 42, 0.94);
+            color: var(--text-main);
+            border-radius: 14px;
+            padding: 12px 14px;
+            outline: none;
+            font-weight: 700;
+        }
+
+        .mic-selected-text {
+            margin-top: 10px;
+            color: var(--text-soft);
+            font-size: 13px;
+            line-height: 1.45;
+        }
+
         .hero-right {
             padding: 24px;
             display: flex;
@@ -502,6 +544,10 @@
                 width: 100%;
             }
 
+            .mic-row {
+                grid-template-columns: 1fr;
+            }
+
             .metrics-grid {
                 grid-template-columns: 1fr;
             }
@@ -519,13 +565,13 @@
         <div class="panel hero-left">
             <div class="eyebrow">
                 <span>●</span>
-                <span>Real-time Voice Agent MVP</span>
+                <span>Knowledge-grounded Voice Agent MVP</span>
             </div>
 
             <h1>Voice AI Agent</h1>
 
             <p class="hero-subtitle">
-                WebRTC üzerinden mikrofon sesini alır, konuşma durduğunda STT → LLM → Streaming TTS pipeline’ını çalıştırır.
+                WebRTC üzerinden mikrofon sesini alır, konuşma durduğunda STT → Knowledge Base → Prompt Service → LLM → Streaming TTS pipeline’ını çalıştırır.
                 Asistan cevap verirken sistem otomatik olarak mikrofon girdisini korumaya alır.
             </p>
 
@@ -536,8 +582,25 @@
                 <button class="btn-secondary" onclick="loadMetrics()">Metrikleri Yenile</button>
             </div>
 
+            <div class="mic-panel">
+                <div class="mic-panel-title">Mikrofon Seçimi</div>
+
+                <div class="mic-row">
+                    <select id="microphoneSelect" class="mic-select">
+                        <option value="">Varsayılan mikrofon</option>
+                    </select>
+
+                    <button class="btn-secondary" onclick="requestAndLoadMicrophones()">Mikrofonları Yenile</button>
+                </div>
+
+                <div id="currentMicLabel" class="mic-selected-text">
+                    Seçili mikrofon: Varsayılan
+                </div>
+            </div>
+
             <p class="footer-note">
-                Mod: Otomatik konuşma algılama + HTTP Streaming TTS. STT tarafı şu an segment bazlı çalışır.
+                Mod: Otomatik konuşma algılama + Knowledge Base destekli doğal cevaplama + HTTP Streaming TTS.
+                STT tarafı şu an segment bazlı çalışır.
             </p>
         </div>
 
@@ -591,7 +654,7 @@
                 <div class="message assistant">
                     <div class="message-top">
                         <span>Asistan</span>
-                        <span>LLM Response</span>
+                        <span>Assistant Response</span>
                     </div>
                     <div id="answerBox" class="message-body">Henüz cevap yok.</div>
                 </div>
@@ -649,7 +712,7 @@
                 </div>
 
                 <div class="metric wide">
-                    <div class="metric-label">LLM Model</div>
+                    <div class="metric-label">Answer Model</div>
                     <div id="llmModelBox" class="small-value">-</div>
                 </div>
 
@@ -718,6 +781,8 @@
     let assistantPlaying = false;
     let latestResponseKey = null;
 
+    let selectedMicrophoneId = "";
+
     const playedAudioResponseIds = new Set();
 
     const statusBox = document.getElementById("statusBox");
@@ -727,6 +792,9 @@
     const voiceOrb = document.getElementById("voiceOrb");
     const logBox = document.getElementById("logBox");
     const assistantAudio = document.getElementById("assistantAudio");
+
+    const microphoneSelect = document.getElementById("microphoneSelect");
+    const currentMicLabel = document.getElementById("currentMicLabel");
 
     function log(message) {
         const now = new Date().toLocaleTimeString();
@@ -760,6 +828,99 @@
         } else if (state === "speaking") {
             statusDot.classList.add("blue");
         }
+    }
+
+    function updateCurrentMicLabel() {
+        if (!microphoneSelect || !currentMicLabel) {
+            return;
+        }
+
+        const selectedOption = microphoneSelect.options[microphoneSelect.selectedIndex];
+
+        if (!selectedOption || !selectedOption.textContent) {
+            currentMicLabel.textContent = "Seçili mikrofon: Varsayılan";
+            return;
+        }
+
+        currentMicLabel.textContent = "Seçili mikrofon: " + selectedOption.textContent;
+    }
+
+    async function loadMicrophones() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+            log("Tarayıcı mikrofon listelemeyi desteklemiyor.");
+            return;
+        }
+
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+
+            const microphones = devices.filter(function (device) {
+                return device.kind === "audioinput";
+            });
+
+            const previousSelectedId = selectedMicrophoneId || microphoneSelect.value || "";
+
+            microphoneSelect.innerHTML = "";
+
+            const defaultOption = document.createElement("option");
+            defaultOption.value = "";
+            defaultOption.textContent = "Varsayılan mikrofon";
+            microphoneSelect.appendChild(defaultOption);
+
+            microphones.forEach(function (device, index) {
+                const option = document.createElement("option");
+                option.value = device.deviceId;
+                option.textContent = device.label || ("Mikrofon " + (index + 1));
+                microphoneSelect.appendChild(option);
+            });
+
+            if (previousSelectedId) {
+                microphoneSelect.value = previousSelectedId;
+                selectedMicrophoneId = microphoneSelect.value || "";
+            }
+
+            updateCurrentMicLabel();
+
+        } catch (error) {
+            log("Mikrofon listesi alınamadı: " + error.message);
+        }
+    }
+
+    async function requestAndLoadMicrophones() {
+        try {
+            const tempStream = await navigator.mediaDevices.getUserMedia({
+                audio: true,
+                video: false
+            });
+
+            tempStream.getTracks().forEach(function (track) {
+                track.stop();
+            });
+
+            await loadMicrophones();
+
+            log("Mikrofon listesi yenilendi.");
+
+        } catch (error) {
+            log("Mikrofon izni alınamadı: " + error.message);
+        }
+    }
+
+    if (microphoneSelect) {
+        microphoneSelect.addEventListener("change", function () {
+            selectedMicrophoneId = microphoneSelect.value || "";
+            updateCurrentMicLabel();
+
+            if (peerConnection) {
+                log("Mikrofon değişti. Yeni mikrofonun aktif olması için WebRTC'yi durdurup tekrar başlat.");
+            }
+        });
+    }
+
+    if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+        navigator.mediaDevices.addEventListener("devicechange", function () {
+            loadMicrophones();
+        });
     }
 
     function updateListeningUi() {
@@ -917,19 +1078,31 @@
             setStatus("Mikrofon izni isteniyor...", "processing");
             log("Mikrofon izni isteniyor.");
 
+            const audioConstraints = {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: false,
+                channelCount: 1,
+                sampleRate: 48000
+            };
+
+            if (selectedMicrophoneId) {
+                audioConstraints.deviceId = {
+                    exact: selectedMicrophoneId
+                };
+            }
+
             localStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                    channelCount: 1,
-                    sampleRate: 48000
-                },
+                audio: audioConstraints,
                 video: false
             });
 
+            await loadMicrophones();
+            updateCurrentMicLabel();
+
             localStream.getAudioTracks().forEach(function (track) {
                 track.enabled = true;
+                log("Aktif mikrofon track: " + (track.label || "Bilinmeyen mikrofon"));
             });
 
             log("Mikrofon izni alındı.");
@@ -1134,7 +1307,7 @@
 
                 row.innerHTML = `
                     <td>${item.id ?? "-"}</td>
-                    <td class="small-text">${item.created_at ?? "-"}</td>
+                    <td>${item.created_at ?? "-"}</td>
                     <td>${shortText(item.transcript, 80)}</td>
                     <td>${shortText(item.answer, 100)}</td>
                     <td>${item.stt_latency_ms ?? "-"}</td>
@@ -1156,6 +1329,7 @@
     window.addEventListener("load", async function () {
         resetUiResponse();
         await clearLatestResponseOnServer();
+        await loadMicrophones();
         loadMetrics();
         setStatus("Hazır.", "ready");
         updateListeningUi();

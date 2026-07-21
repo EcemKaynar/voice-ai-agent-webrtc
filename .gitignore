@@ -1,12 +1,15 @@
-.env
 .venv/
-venv/
+__pycache__/
+*.pyc
+
+.env
 
 data/
 *.db
+*.sqlite
+*.sqlite3
+
 *.wav
 *.mp3
 
-__pycache__/
-*.pyc
-*.log
+.DS_Store

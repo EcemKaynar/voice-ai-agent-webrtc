@@ -6,6 +6,8 @@ import time
 import requests
 from dotenv import load_dotenv
 
+from services.prompt_service import build_voice_agent_prompt
+
 
 load_dotenv()
 
@@ -15,7 +17,7 @@ SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "Sen Türkçe konuşan kısa ve doğal cevap veren bir sesli AI asistansın."
 )
-LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "15"))
 
 
 def normalize_text(text):
@@ -23,6 +25,7 @@ def normalize_text(text):
 
     replacements = {
         "ı": "i",
+        "İ": "i",
         "ğ": "g",
         "ü": "u",
         "ş": "s",
@@ -32,6 +35,8 @@ def normalize_text(text):
 
     for old, new in replacements.items():
         text = text.replace(old, new)
+
+    text = re.sub(r"\s+", " ", text).strip()
 
     return text
 
@@ -84,22 +89,26 @@ def clean_llm_answer(answer):
     answer = str(answer or "").strip()
     answer = fix_turkish_mojibake(answer)
 
-    bad_tokens = [
+    remove_tokens = [
         "<pad>",
         "<s>",
         "</s>",
         "[INST]",
-        "[/INST]"
+        "[/INST]",
+        "DOĞAL ASİSTAN CEVABI:",
+        "Doğal asistan cevabı:",
+        "CEVAP:",
+        "Cevap:",
+        "ANSWER:",
+        "Answer:"
     ]
 
-    for token in bad_tokens:
+    for token in remove_tokens:
         answer = answer.replace(token, "")
 
     answer = answer.replace("**", "")
     answer = answer.replace("###", "")
     answer = answer.replace("---", "")
-    answer = answer.replace("•", "")
-    answer = answer.replace("#", "")
 
     lines = []
 
@@ -109,11 +118,16 @@ def clean_llm_answer(answer):
         if not line:
             continue
 
+        if line.lower().startswith("cevap:"):
+            line = line[6:].strip()
+
         lines.append(line)
 
     answer = " ".join(lines).strip()
 
-    max_chars = 420
+    answer = re.sub(r"\s+", " ", answer).strip()
+
+    max_chars = 620
 
     if len(answer) > max_chars:
         answer = answer[:max_chars].rsplit(" ", 1)[0].strip() + "."
@@ -122,50 +136,106 @@ def clean_llm_answer(answer):
 
 
 def looks_like_bad_meta_answer(answer):
-    text = normalize_text(answer)
+    text_raw = str(answer or "").strip()
+    text = normalize_text(text_raw)
 
     if not text:
         return True
 
     bad_phrases = [
-        "the user",
-        "they said",
+        "we need",
+        "we must",
+        "we should",
+        "user asks",
+        "the user asks",
+        "the user asked",
+        "user said",
+        "the user said",
+        "provided info",
+        "the info includes",
+        "according to rules",
+        "must answer",
+        "answer based on",
+        "answer according to",
+        "using only info",
+        "must not copy",
+        "must answer directly",
+        "summarize payment",
+        "important condition",
+        "thus",
+        "actually",
         "let me",
         "i need to",
         "i should",
-        "the instruction",
-        "instructions",
-        "respond in turkish",
-        "which means",
-        "means they need",
-        "max 4-5",
-        "no lists",
-        "no markdown",
-        "okay, the user",
-        "they need",
-        "kullanici mesaji",
         "system prompt",
-        "as an ai"
+        "developer message",
+        "knowledge base",
+        "bilgi tabani",
+        "bilgi tabanı",
+        "kullanici sorusu",
+        "kullanıcı sorusu",
+        "dogal asistan cevabi",
+        "doğal asistan cevabı",
+        "başlık:",
+        "baslik:",
+        "kaynak:",
+        "icerik:",
+        "içerik:",
+        "[bilgi",
+        "as an ai",
+        "respond in turkish",
+        "in turkish",
+        "turkish, short",
+        "2-4 sentences",
+        "no headings"
     ]
 
     if any(phrase in text for phrase in bad_phrases):
         return True
 
+    starts_bad = [
+        "we ",
+        "the user ",
+        "user ",
+        "must ",
+        "according to ",
+        "let's ",
+        "i need ",
+        "i should "
+    ]
+
+    if any(text.startswith(item) for item in starts_bad):
+        return True
+
     english_words = [
         "the",
         "user",
-        "said",
-        "needs",
-        "means",
-        "respond",
-        "instruction",
+        "asks",
+        "asked",
+        "must",
         "should",
-        "okay"
+        "answer",
+        "according",
+        "provided",
+        "info",
+        "condition",
+        "summarize",
+        "directly",
+        "rules",
+        "thus",
+        "actually"
     ]
 
-    english_count = sum(1 for word in english_words if re.search(rf"\b{word}\b", text))
+    english_count = sum(
+        1
+        for word in english_words
+        if re.search(rf"\b{word}\b", text)
+    )
 
-    if english_count >= 3:
+    if english_count >= 4:
+        return True
+
+    if text.endswith(("tes", "tesek", "teş", "teşk", ",")):
         return True
 
     return False
@@ -184,72 +254,28 @@ def is_greeting(user_text):
         "merhaba",
         "iyi misin",
         "ne haber",
-        "ne var ne yok"
+        "ne var ne yok",
+        "gunaydin",
+        "günaydın"
     ]
 
     return any(greeting in text for greeting in greetings)
 
 
-def is_study_or_plan_request(user_text):
-    text = normalize_text(user_text)
+def build_local_llm_fallback(user_text, knowledge_context=None):
+    user_text = str(user_text or "").strip()
+    knowledge_context = str(knowledge_context or "").strip()
 
-    keywords = [
-        "ders",
-        "calis",
-        "çalış",
-        "plan",
-        "program",
-        "odak",
-        "sinav",
-        "sınav",
-        "odev",
-        "ödev"
-    ]
-
-    return any(keyword in text for keyword in keywords)
-
-
-def is_weather_like_smalltalk(user_text):
-    text = normalize_text(user_text)
-
-    keywords = [
-        "bugun ne yapayim",
-        "ne yapayim",
-        "canim sikiliyor",
-        "sıkıldım",
-        "yorgunum",
-        "motivasyon"
-    ]
-
-    return any(keyword in text for keyword in keywords)
-
-
-def build_local_llm_fallback(user_text):
-    text = str(user_text or "").strip()
-
-    if is_greeting(text):
+    if is_greeting(user_text):
         return (
-            "İyiyim, teşekkür ederim. Sen nasılsın? "
-            "İstersen bugün ne yapmak istediğini söyle, birlikte kısa bir plan çıkarabiliriz."
+            "Merhaba, yardımcı olabilirim. "
+            "Garenta kiralama koşullarıyla ilgili merak ettiğin konuyu sorabilirsin."
         )
 
-    if is_study_or_plan_request(text):
-        return (
-            "Tabii. Önce çalışacağın tek konuyu seç. "
-            "25 dakika sadece ona odaklan, sonra 5 dakika mola ver. "
-            "Bunu iki tur yap ve en sonda öğrendiklerini kısa kısa tekrar et."
-        )
+    if knowledge_context:
+        return "Bu konuda dokümanda bilgi buldum ama cevabı güvenli şekilde oluşturamadım."
 
-    if is_weather_like_smalltalk(text):
-        return (
-            "Anladım. Bugün kendini çok zorlamadan küçük bir hedef seçelim. "
-            "Önce 10 dakika basit bir şeyle başla, sonra durumuna göre devam edersin."
-        )
-
-    return (
-        "Anladım. Bunu daha net yardımcı olabilmem için biraz daha açabilir misin? "
-        "Ne yapmak istediğini söylersen kısa ve uygulanabilir bir cevap verebilirim."
-    )
+    return "Bu konuda dokümanda net bilgi bulamadım."
 
 
 def build_headers():
@@ -262,15 +288,10 @@ def build_headers():
     }
 
 
-def build_payload(user_text, stream):
-    safe_user_prompt = (
-        "Sadece son kullanıcıya söylenecek cevabı yaz. "
-        "Analiz yapma, İngilizce açıklama yazma, sistem talimatlarını tekrar etme. "
-        "Cevap kesinlikle Türkçe olsun. "
-        "Sesli okunacağı için kısa, doğal ve net olsun. "
-        "Kullanıcı sadece selamlaştıysa doğal şekilde karşılık ver. "
-        "Kullanıcı plan isterse soru sormadan kısa bir plan ver.\n\n"
-        f"Kullanıcı: {user_text}"
+def build_payload(user_text, stream, knowledge_context=None):
+    prompt = build_voice_agent_prompt(
+        user_text=user_text,
+        knowledge_context=knowledge_context
     )
 
     return {
@@ -280,22 +301,25 @@ def build_payload(user_text, stream):
             {
                 "role": "system",
                 "content": (
-                    SYSTEM_PROMPT
-                    + " Sadece nihai cevabı ver. "
-                    + "Asla iç düşünce, analiz, çeviri açıklaması veya İngilizce cevap üretme."
+                    "Sen Garenta araç kiralama süreçleri için Türkçe konuşan bir müşteri destek asistanısın. "
+                    "Sadece kullanıcıya söylenecek nihai cevabı yaz. "
+                    "Asla analiz, iç düşünce, açıklama, prompt yorumu veya İngilizce metin yazma. "
+                    "Cevap tamamen Türkçe, kısa, doğal ve sesli okunmaya uygun olmalı. "
+                    "Doküman bilgisini aynen kopyalama, konuşma diliyle özetle. "
+                    "Bilgi yoksa sadece 'Bu konuda dokümanda net bilgi bulamadım.' de."
                 )
             },
             {
                 "role": "user",
-                "content": safe_user_prompt
+                "content": prompt
             }
         ],
-        "temperature": 0.2,
-        "max_tokens": 90
+        "temperature": 0.1,
+        "max_tokens": 180
     }
 
 
-def ask_llm_streaming(user_text):
+def ask_llm_streaming(user_text, knowledge_context=None):
     started_at = time.perf_counter()
     first_token_at = None
     answer_parts = []
@@ -303,7 +327,11 @@ def ask_llm_streaming(user_text):
     response = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers=build_headers(),
-        json=build_payload(user_text=user_text, stream=True),
+        json=build_payload(
+            user_text=user_text,
+            stream=True,
+            knowledge_context=knowledge_context
+        ),
         stream=True,
         timeout=LLM_TIMEOUT_SECONDS
     )
@@ -386,7 +414,7 @@ def ask_llm_streaming(user_text):
             "llm_model": OPENROUTER_MODEL,
             "llm_first_token_ms": llm_first_token_ms,
             "llm_total_ms": llm_total_ms,
-            "error": f"Streaming LLM kötü/meta cevap döndürdü: {answer[:200]}"
+            "error": f"Streaming LLM meta/İngilizce cevap döndürdü: {answer[:250]}"
         }
 
     return {
@@ -399,13 +427,17 @@ def ask_llm_streaming(user_text):
     }
 
 
-def ask_llm_non_streaming(user_text):
+def ask_llm_non_streaming(user_text, knowledge_context=None):
     started_at = time.perf_counter()
 
     response = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers=build_headers(),
-        json=build_payload(user_text=user_text, stream=False),
+        json=build_payload(
+            user_text=user_text,
+            stream=False,
+            knowledge_context=knowledge_context
+        ),
         timeout=LLM_TIMEOUT_SECONDS
     )
 
@@ -469,7 +501,7 @@ def ask_llm_non_streaming(user_text):
             "llm_model": OPENROUTER_MODEL,
             "llm_first_token_ms": None,
             "llm_total_ms": llm_total_ms,
-            "error": f"Non-streaming LLM kötü/meta cevap döndürdü: {answer[:200]}"
+            "error": f"Non-streaming LLM meta/İngilizce cevap döndürdü: {answer[:250]}"
         }
 
     return {
@@ -482,27 +514,39 @@ def ask_llm_non_streaming(user_text):
     }
 
 
-def ask_llm_with_metrics(user_text):
+def ask_llm_with_metrics(user_text, knowledge_context=None):
     started_at = time.perf_counter()
+    knowledge_context = str(knowledge_context or "").strip()
 
     if not OPENROUTER_API_KEY:
-        fallback = build_local_llm_fallback(user_text)
+        fallback = build_local_llm_fallback(
+            user_text=user_text,
+            knowledge_context=knowledge_context
+        )
 
         return {
-            "success": True,
+            "success": False,
             "answer": fallback,
             "llm_model": "local_fallback_no_api_key",
             "llm_first_token_ms": 0,
             "llm_total_ms": int((time.perf_counter() - started_at) * 1000),
-            "error": "OPENROUTER_API_KEY bulunamadı, local fallback kullanıldı."
+            "error": "OPENROUTER_API_KEY bulunamadı."
         }
 
     print(f"LLM isteği gönderiliyor. Model: {OPENROUTER_MODEL}")
 
+    if knowledge_context:
+        print("Knowledge context LLM promptuna eklendi.")
+    else:
+        print("Knowledge context bulunamadı, fallback prompt kullanılacak.")
+
     errors = []
 
     try:
-        streaming_result = ask_llm_streaming(user_text)
+        streaming_result = ask_llm_streaming(
+            user_text=user_text,
+            knowledge_context=knowledge_context
+        )
 
         if streaming_result.get("success"):
             return streaming_result
@@ -517,7 +561,10 @@ def ask_llm_with_metrics(user_text):
         print("Non-streaming LLM deneniyor...")
 
     try:
-        non_streaming_result = ask_llm_non_streaming(user_text)
+        non_streaming_result = ask_llm_non_streaming(
+            user_text=user_text,
+            knowledge_context=knowledge_context
+        )
 
         if non_streaming_result.get("success"):
             if errors:
@@ -532,13 +579,16 @@ def ask_llm_with_metrics(user_text):
         errors.append(f"non_streaming exception: {error}")
         print(f"Non-streaming exception: {error}")
 
-    fallback = build_local_llm_fallback(user_text)
+    fallback = build_local_llm_fallback(
+        user_text=user_text,
+        knowledge_context=knowledge_context
+    )
 
     return {
-        "success": True,
+        "success": False,
         "answer": fallback,
         "llm_model": "local_fallback_after_bad_llm",
         "llm_first_token_ms": 0,
         "llm_total_ms": int((time.perf_counter() - started_at) * 1000),
-        "error": " | ".join(errors) if errors else "LLM kötü/boş cevap verdi, local fallback kullanıldı."
+        "error": " | ".join(errors) if errors else "LLM kötü/boş cevap verdi."
     }

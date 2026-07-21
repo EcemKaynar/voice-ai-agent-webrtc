@@ -40,25 +40,34 @@ from services.tts_service import (
     get_tts_config
 )
 
+from services.knowledge_base_service import (
+    search_knowledge,
+    get_knowledge_base_status,
+    reload_knowledge_base
+)
+
+from services.transcript_normalizer_service import normalize_transcript_for_domain
+from services.kb_answer_service import build_direct_kb_answer
+
 
 load_dotenv()
 
 APP_NAME = os.getenv("APP_NAME", "Voice AI Agent WebRTC")
 
 AUDIO_OUTPUT_DIR = os.getenv("AUDIO_OUTPUT_DIR", "data/audio_chunks")
-MIN_AUDIO_RMS = float(os.getenv("MIN_AUDIO_RMS", "80"))
+TTS_OUTPUT_DIR = os.getenv("TTS_OUTPUT_DIR", "data/tts_outputs")
+
+MIN_AUDIO_RMS = float(os.getenv("MIN_AUDIO_RMS", "70"))
 TARGET_SAMPLE_RATE = int(os.getenv("TARGET_SAMPLE_RATE", "16000"))
 
-SPEECH_RMS_THRESHOLD = float(os.getenv("SPEECH_RMS_THRESHOLD", "180"))
-SILENCE_END_SECONDS = float(os.getenv("SILENCE_END_SECONDS", "0.9"))
-MIN_UTTERANCE_SECONDS = float(os.getenv("MIN_UTTERANCE_SECONDS", "0.7"))
-MAX_UTTERANCE_SECONDS = float(os.getenv("MAX_UTTERANCE_SECONDS", "12"))
-PRE_SPEECH_SECONDS = float(os.getenv("PRE_SPEECH_SECONDS", "0.25"))
+SPEECH_RMS_THRESHOLD = float(os.getenv("SPEECH_RMS_THRESHOLD", "150"))
+SILENCE_END_SECONDS = float(os.getenv("SILENCE_END_SECONDS", "1.2"))
+MIN_UTTERANCE_SECONDS = float(os.getenv("MIN_UTTERANCE_SECONDS", "1.0"))
+MAX_UTTERANCE_SECONDS = float(os.getenv("MAX_UTTERANCE_SECONDS", "15"))
+PRE_SPEECH_SECONDS = float(os.getenv("PRE_SPEECH_SECONDS", "0.45"))
 
-MIN_SPEECH_SECONDS = float(os.getenv("MIN_SPEECH_SECONDS", "0.3"))
-MIN_SPEECH_RATIO = float(os.getenv("MIN_SPEECH_RATIO", "0.12"))
-
-TTS_OUTPUT_DIR = os.getenv("TTS_OUTPUT_DIR", "data/tts_outputs")
+MIN_SPEECH_SECONDS = float(os.getenv("MIN_SPEECH_SECONDS", "0.45"))
+MIN_SPEECH_RATIO = float(os.getenv("MIN_SPEECH_RATIO", "0.10"))
 
 Path(AUDIO_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 Path(TTS_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
@@ -134,6 +143,7 @@ def normalize_text_for_filter(text):
 
     replacements = {
         "ı": "i",
+        "İ": "i",
         "ğ": "g",
         "ü": "u",
         "ş": "s",
@@ -220,10 +230,13 @@ def get_streaming_config():
         "webrtc_input_audio_enabled": True,
         "webrtc_output_audio_enabled": False,
         "assistant_audio_feedback_protection": True,
+        "knowledge_base_enabled": True,
+        "prompt_service_enabled": True,
         "note": (
             "This version uses automatic turn taking. "
-            "The browser keeps the microphone track alive, but backend ignores audio "
-            "while assistant is speaking or while server is processing."
+            "STT is segment based. TTS is streamed with HTTP StreamingResponse. "
+            "Knowledge base context is sent to LLM for natural grounded answers. "
+            "Direct KB answer is used only as fallback when LLM answer is weak or meta."
         )
     }
 
@@ -285,13 +298,148 @@ async def handle_transcript_with_llm(
     if pipeline_started_at is None:
         pipeline_started_at = time.perf_counter()
 
+    normalization_result = normalize_transcript_for_domain(transcript)
+    effective_query = normalization_result.get("normalized_query") or transcript
+    display_transcript = effective_query if normalization_result.get("correction_applied") else transcript
+
+    print(f"[{peer_id}] Transcript normalization:")
+    print(f"  Original: {transcript}")
+    print(f"  Effective query: {effective_query}")
+    print(f"  Correction applied: {normalization_result.get('correction_applied')}")
+    print(f"  Reason: {normalization_result.get('correction_reason')}")
+    print(f"  Confidence: {normalization_result.get('confidence')}")
+
+    print(f"[{peer_id}] Knowledge base aranıyor:")
+    print(f"  Query: {effective_query}")
+
+    knowledge_result = search_knowledge(
+        query=effective_query,
+        top_k=2
+    )
+
+    knowledge_context = knowledge_result.get("context", "")
+
+    print(f"[{peer_id}] Knowledge sonucu:")
+    print(f"  Found: {knowledge_result.get('found')}")
+    print(f"  Intent profiles: {knowledge_result.get('intent_profiles')}")
+    print(f"  Result count: {len(knowledge_result.get('results', []))}")
+
+    for item in knowledge_result.get("results", []):
+        print(
+            f"  - Score: {item.get('score')} | "
+            f"Title: {item.get('title')} | "
+            f"Source: {item.get('source')}"
+        )
+
     print(f"[{peer_id}] LLM'e gönderiliyor:")
-    print(f"  User text: {transcript}")
+    print(f"  User text: {effective_query}")
 
     llm_result = await asyncio.to_thread(
         ask_llm_with_metrics,
-        transcript
+        effective_query,
+        knowledge_context
     )
+
+    direct_kb_result = build_direct_kb_answer(
+        user_query=effective_query,
+        knowledge_result=knowledge_result
+    )
+
+    answer_for_quality_check = str(llm_result.get("answer") or "").strip()
+    answer_quality_text = normalize_text_for_filter(answer_for_quality_check)
+
+    bad_answer_markers = [
+        "bilgi 1",
+        "bilgi tabani",
+        "bilgi tabanı",
+        "kaynak:",
+        "icerik:",
+        "içerik:",
+        "baslik:",
+        "başlık:",
+        "dokumana gore -",
+        "dokümana göre -",
+        "kiralamaya ait tum ucretler",
+        "kiralamaya ait tüm ücretler",
+        "bu konuda dokumanda net bilgi bulamadim",
+        "bu konuda dokümanda net bilgi bulamadım",
+        "we need",
+        "we must",
+        "we should",
+        "user asks",
+        "the user asks",
+        "user asked",
+        "the user asked",
+        "provided info",
+        "the info includes",
+        "according to rules",
+        "must answer",
+        "answer based on",
+        "answer according to",
+        "using only info",
+        "must not copy",
+        "must answer directly",
+        "summarize payment",
+        "important condition",
+        "thus",
+        "actually",
+        "let me",
+        "i need to",
+        "i should",
+        "system prompt",
+        "knowledge base",
+        "respond in turkish",
+        "in turkish",
+        "turkish, short",
+        "2-4 sentences",
+        "no headings"
+    ]
+
+    should_use_direct_fallback = False
+
+    if not llm_result.get("success"):
+        should_use_direct_fallback = True
+
+    if str(llm_result.get("llm_model") or "").startswith("local_fallback"):
+        should_use_direct_fallback = True
+
+    if not answer_for_quality_check:
+        should_use_direct_fallback = True
+
+    if any(marker in answer_quality_text for marker in bad_answer_markers):
+        should_use_direct_fallback = True
+
+    if len(answer_for_quality_check) < 35 and direct_kb_result:
+        should_use_direct_fallback = True
+
+    english_meta_words = [
+        "we",
+        "user",
+        "must",
+        "should",
+        "answer",
+        "provided",
+        "info",
+        "according",
+        "condition",
+        "summarize",
+        "directly"
+    ]
+
+    english_meta_count = sum(
+        1
+        for word in english_meta_words
+        if f" {word} " in f" {answer_quality_text} "
+    )
+
+    if english_meta_count >= 3:
+        should_use_direct_fallback = True
+
+    if should_use_direct_fallback and direct_kb_result:
+        print(f"[{peer_id}] LLM cevabı zayıf/ham/meta bulundu. Direct KB fallback kullanıldı.")
+        llm_result = direct_kb_result
+    else:
+        print(f"[{peer_id}] Natural LLM answer kullanıldı.")
 
     print(f"[{peer_id}] LLM sonucu:")
     print(f"  Success: {llm_result.get('success')}")
@@ -322,11 +470,15 @@ async def handle_transcript_with_llm(
 
     pending_tts_streams[response_id] = {
         "peer_id": peer_id,
-        "transcript": transcript,
+        "transcript": display_transcript,
+        "raw_transcript": transcript,
+        "normalized_query": effective_query,
         "answer": answer,
         "audio_input_path": audio_input_path,
         "stt_result": stt_result,
         "llm_result": llm_result,
+        "knowledge_result": knowledge_result,
+        "normalization_result": normalization_result,
         "pipeline_started_at": pipeline_started_at,
         "created_at": datetime.now().isoformat(timespec="milliseconds")
     }
@@ -341,7 +493,12 @@ async def handle_transcript_with_llm(
         "id": response_id,
         "metric_id": None,
         "peer_id": peer_id,
-        "transcript": transcript,
+        "transcript": display_transcript,
+        "raw_transcript": transcript,
+        "normalized_query": effective_query,
+        "transcript_correction_applied": normalization_result.get("correction_applied"),
+        "transcript_correction_reason": normalization_result.get("correction_reason"),
+        "transcript_correction_confidence": normalization_result.get("confidence"),
         "answer": answer,
         "audio_url": audio_url,
         "stt_llm_tts_status": "tts_stream_pending",
@@ -354,6 +511,17 @@ async def handle_transcript_with_llm(
         "llm_model": llm_result.get("llm_model"),
         "tts_voice": get_tts_config().get("tts_voice"),
         "streaming_config": get_streaming_config(),
+        "knowledge_found": knowledge_result.get("found"),
+        "knowledge_result_count": len(knowledge_result.get("results", [])),
+        "knowledge_intent_profiles": knowledge_result.get("intent_profiles", []),
+        "knowledge_sources": [
+            {
+                "title": item.get("title"),
+                "source": item.get("source"),
+                "score": item.get("score")
+            }
+            for item in knowledge_result.get("results", [])
+        ],
         "updated_at": datetime.now().isoformat(timespec="milliseconds")
     })
 
@@ -623,6 +791,13 @@ async def consume_audio_track(track, peer_id):
 @app.on_event("startup")
 async def on_startup():
     print("Application startup başladı.")
+
+    try:
+        kb_status = get_knowledge_base_status()
+        print(f"Knowledge base status: {kb_status}")
+    except Exception as error:
+        print(f"Knowledge base yükleme hatası: {error}")
+
     print("STT modeli preload ediliyor...")
 
     try:
@@ -670,7 +845,8 @@ def health():
         "min_speech_ratio": MIN_SPEECH_RATIO,
         "tts_config": get_tts_config(),
         "pending_tts_stream_count": len(pending_tts_streams),
-        "client_states": client_states
+        "client_states": client_states,
+        "knowledge_base": get_knowledge_base_status()
     })
 
 
@@ -678,7 +854,7 @@ def health():
 def config():
     return JSONResponse({
         "app": APP_NAME,
-        "mode": "webrtc_auto_turn_taking_streaming_tts_metrics_mvp",
+        "mode": "webrtc_auto_turn_taking_knowledge_grounded_streaming_tts_metrics_mvp",
         "audio_config": {
             "target_sample_rate": TARGET_SAMPLE_RATE,
             "min_audio_rms": MIN_AUDIO_RMS,
@@ -692,8 +868,29 @@ def config():
         },
         "stt_config": get_stt_config(),
         "tts_config": get_tts_config(),
-        "streaming_config": get_streaming_config()
+        "streaming_config": get_streaming_config(),
+        "knowledge_base": get_knowledge_base_status()
     })
+
+
+@app.get("/knowledge/status")
+def knowledge_status():
+    return JSONResponse(get_knowledge_base_status())
+
+
+@app.get("/knowledge/search")
+def knowledge_search(q: str, top_k: int = 4):
+    return JSONResponse(
+        search_knowledge(
+            query=q,
+            top_k=top_k
+        )
+    )
+
+
+@app.post("/knowledge/reload")
+def knowledge_reload():
+    return JSONResponse(reload_knowledge_base())
 
 
 @app.get("/latest-response")
