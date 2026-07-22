@@ -40,14 +40,15 @@ from services.tts_service import (
     get_tts_config
 )
 
-from services.knowledge_base_service import (
+from services.semantic_knowledge_base_service import (
     search_knowledge,
     get_knowledge_base_status,
-    reload_knowledge_base
+    reload_knowledge_base,
+    build_extractive_rag_fallback
 )
 
 from services.transcript_normalizer_service import normalize_transcript_for_domain
-from services.kb_answer_service import build_direct_kb_answer
+#from services.kb_answer_service import build_direct_kb_answer
 
 
 load_dotenv()
@@ -103,7 +104,9 @@ class OfferRequest(BaseModel):
     sdp: str
     type: str
 
-
+class TextTestRequest(BaseModel):
+    text: str
+    
 class ClientStateRequest(BaseModel):
     peer_id: str
     user_speaking: bool = True
@@ -314,7 +317,7 @@ async def handle_transcript_with_llm(
 
     knowledge_result = search_knowledge(
         query=effective_query,
-        top_k=2
+        top_k=4
     )
 
     knowledge_context = knowledge_result.get("context", "")
@@ -340,7 +343,7 @@ async def handle_transcript_with_llm(
         knowledge_context
     )
 
-    direct_kb_result = build_direct_kb_answer(
+    direct_kb_result = build_extractive_rag_fallback(
         user_query=effective_query,
         knowledge_result=knowledge_result
     )
@@ -361,8 +364,6 @@ async def handle_transcript_with_llm(
         "dokümana göre -",
         "kiralamaya ait tum ucretler",
         "kiralamaya ait tüm ücretler",
-        "bu konuda dokumanda net bilgi bulamadim",
-        "bu konuda dokümanda net bilgi bulamadım",
         "we need",
         "we must",
         "we should",
@@ -407,9 +408,6 @@ async def handle_transcript_with_llm(
         should_use_direct_fallback = True
 
     if any(marker in answer_quality_text for marker in bad_answer_markers):
-        should_use_direct_fallback = True
-
-    if len(answer_for_quality_check) < 35 and direct_kb_result:
         should_use_direct_fallback = True
 
     english_meta_words = [
@@ -515,13 +513,17 @@ async def handle_transcript_with_llm(
         "knowledge_result_count": len(knowledge_result.get("results", [])),
         "knowledge_intent_profiles": knowledge_result.get("intent_profiles", []),
         "knowledge_sources": [
-            {
-                "title": item.get("title"),
-                "source": item.get("source"),
-                "score": item.get("score")
-            }
-            for item in knowledge_result.get("results", [])
-        ],
+    {
+        "title": item.get("title"),
+        "source": item.get("source"),
+        "score": item.get("score"),
+        "semantic_score": item.get("semantic_score"),
+        "lexical_score": item.get("lexical_score"),
+        "structured": item.get("structured"),
+        "segment": item.get("segment"),
+        "content_preview": str(item.get("content") or "")[:500]
+    }
+    for item in knowledge_result.get("results", [])],
         "updated_at": datetime.now().isoformat(timespec="milliseconds")
     })
 
@@ -891,7 +893,177 @@ def knowledge_search(q: str, top_k: int = 4):
 @app.post("/knowledge/reload")
 def knowledge_reload():
     return JSONResponse(reload_knowledge_base())
+@app.get("/text-test")
+async def text_test(q: str, use_llm: bool = True):
+    transcript = str(q or "").strip()
 
+    if not transcript:
+        return JSONResponse({
+            "success": False,
+            "error": "q parametresi boş olamaz."
+        })
+
+    normalization_result = normalize_transcript_for_domain(transcript)
+    effective_query = normalization_result.get("normalized_query") or transcript
+
+    knowledge_result = search_knowledge(
+        query=effective_query,
+        top_k=4
+    )
+
+    knowledge_context = knowledge_result.get("context", "")
+
+    direct_kb_result = build_extractive_rag_fallback(
+        user_query=effective_query,
+        knowledge_result=knowledge_result
+    )
+
+    llm_result = None
+    used_answer_source = "none"
+
+    if use_llm:
+        llm_result = await asyncio.to_thread(
+            ask_llm_with_metrics,
+            effective_query,
+            knowledge_context
+        )
+
+        answer_for_quality_check = str(llm_result.get("answer") or "").strip()
+        answer_quality_text = normalize_text_for_filter(answer_for_quality_check)
+
+        bad_answer_markers = [
+            "bilgi 1",
+            "bilgi tabani",
+            "bilgi tabanı",
+            "kaynak:",
+            "icerik:",
+            "içerik:",
+            "baslik:",
+            "başlık:",
+            "dokumana gore -",
+            "dokümana göre -",
+            "kiralamaya ait tum ucretler",
+            "kiralamaya ait tüm ücretler",
+            "we need",
+            "we must",
+            "we should",
+            "user asks",
+            "the user asks",
+            "user asked",
+            "the user asked",
+            "provided info",
+            "the info includes",
+            "according to rules",
+            "must answer",
+            "answer based on",
+            "answer according to",
+            "using only info",
+            "must not copy",
+            "must answer directly",
+            "summarize payment",
+            "important condition",
+            "thus",
+            "actually",
+            "let me",
+            "i need to",
+            "i should",
+            "system prompt",
+            "knowledge base",
+            "respond in turkish",
+            "in turkish",
+            "turkish, short",
+            "2-4 sentences",
+            "no headings"
+        ]
+
+        should_use_direct_fallback = False
+
+        if not llm_result.get("success"):
+            should_use_direct_fallback = True
+
+        if str(llm_result.get("llm_model") or "").startswith("local_fallback"):
+            should_use_direct_fallback = True
+
+        if not answer_for_quality_check:
+            should_use_direct_fallback = True
+
+        if any(marker in answer_quality_text for marker in bad_answer_markers):
+            should_use_direct_fallback = True
+
+        english_meta_words = [
+            "we",
+            "user",
+            "must",
+            "should",
+            "answer",
+            "provided",
+            "info",
+            "according",
+            "condition",
+            "summarize",
+            "directly"
+        ]
+
+        english_meta_count = sum(
+            1
+            for word in english_meta_words
+            if f" {word} " in f" {answer_quality_text} "
+        )
+
+        if english_meta_count >= 3:
+            should_use_direct_fallback = True
+
+        if should_use_direct_fallback and direct_kb_result:
+            final_result = direct_kb_result
+            used_answer_source = "direct_kb_fallback"
+        else:
+            final_result = llm_result
+            used_answer_source = "natural_llm_answer"
+
+    else:
+        final_result = direct_kb_result or {
+            "success": False,
+            "answer": "Bu konuda dokümanda net bilgi bulamadım.",
+            "llm_model": "no_llm_no_direct_kb",
+            "llm_first_token_ms": 0,
+            "llm_total_ms": 0,
+            "error": "use_llm=false ve direct KB cevabı bulunamadı."
+        }
+        used_answer_source = "direct_kb_only"
+
+    return JSONResponse({
+        "success": True,
+        "input_text": transcript,
+        "effective_query": effective_query,
+        "normalization": normalization_result,
+        "knowledge_found": knowledge_result.get("found"),
+        "knowledge_intent_profiles": knowledge_result.get("intent_profiles", []),
+        "knowledge_sources": [
+            {
+                "title": item.get("title"),
+        "source": item.get("source"),
+        "score": item.get("score"),
+        "semantic_score": item.get("semantic_score"),
+        "lexical_score": item.get("lexical_score"),
+        "structured": item.get("structured"),
+        "segment": item.get("segment"),
+        "topic": item.get("topic"),
+        "topic_score": item.get("topic_score"),
+        "content_preview": str(item.get("content") or "")[:400]
+            }
+            for item in knowledge_result.get("results", [])
+        ],
+        "answer_source": used_answer_source,
+        "answer": final_result.get("answer"),
+        "answer_model": final_result.get("llm_model"),
+        "llm_result": llm_result,
+        "direct_kb_result": direct_kb_result
+    })
+
+
+@app.post("/text-test")
+async def text_test_post(request: TextTestRequest):
+    return await text_test(q=request.text, use_llm=True)
 
 @app.get("/latest-response")
 def get_latest_response():

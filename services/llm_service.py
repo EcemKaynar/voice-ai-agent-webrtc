@@ -17,7 +17,7 @@ SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "Sen Türkçe konuşan kısa ve doğal cevap veren bir sesli AI asistansın."
 )
-LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "15"))
+LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
 
 
 def normalize_text(text):
@@ -124,7 +124,6 @@ def clean_llm_answer(answer):
         lines.append(line)
 
     answer = " ".join(lines).strip()
-
     answer = re.sub(r"\s+", " ", answer).strip()
 
     max_chars = 620
@@ -133,6 +132,37 @@ def clean_llm_answer(answer):
         answer = answer[:max_chars].rsplit(" ", 1)[0].strip() + "."
 
     return answer.strip()
+
+
+def looks_like_incomplete_answer(answer):
+    text = str(answer or "").strip()
+
+    if not text:
+        return True
+
+    if text[-1] not in ".?!":
+        return True
+
+    normalized = normalize_text(text).rstrip(".?! ")
+
+    dangling_endings = (
+        " kullan",
+        " kullanabilir",
+        " kullanamaz",
+        " gerekmektedir ve",
+        " gerekir ve",
+        " ancak",
+        " çünkü",
+        " veya",
+        " ve",
+        " ile",
+        " için",
+        " olarak",
+        " ayrıca",
+        " buna göre"
+    )
+
+    return normalized.endswith(dangling_endings)
 
 
 def looks_like_bad_meta_answer(answer):
@@ -315,7 +345,7 @@ def build_payload(user_text, stream, knowledge_context=None):
             }
         ],
         "temperature": 0.1,
-        "max_tokens": 180
+        "max_tokens": 260
     }
 
 
@@ -407,14 +437,14 @@ def ask_llm_streaming(user_text, knowledge_context=None):
             "error": "Streaming LLM boş cevap döndürdü."
         }
 
-    if looks_like_bad_meta_answer(answer):
+    if looks_like_bad_meta_answer(answer) or looks_like_incomplete_answer(answer):
         return {
             "success": False,
             "answer": "",
             "llm_model": OPENROUTER_MODEL,
             "llm_first_token_ms": llm_first_token_ms,
             "llm_total_ms": llm_total_ms,
-            "error": f"Streaming LLM meta/İngilizce cevap döndürdü: {answer[:250]}"
+            "error": f"Streaming LLM eksik veya geçersiz cevap döndürdü: {answer[:250]}"
         }
 
     return {
@@ -494,14 +524,14 @@ def ask_llm_non_streaming(user_text, knowledge_context=None):
             "error": "Non-streaming LLM boş cevap döndürdü."
         }
 
-    if looks_like_bad_meta_answer(answer):
+    if looks_like_bad_meta_answer(answer) or looks_like_incomplete_answer(answer):
         return {
             "success": False,
             "answer": "",
             "llm_model": OPENROUTER_MODEL,
             "llm_first_token_ms": None,
             "llm_total_ms": llm_total_ms,
-            "error": f"Non-streaming LLM meta/İngilizce cevap döndürdü: {answer[:250]}"
+            "error": f"Non-streaming LLM eksik veya geçersiz cevap döndürdü: {answer[:250]}"
         }
 
     return {
@@ -553,12 +583,12 @@ def ask_llm_with_metrics(user_text, knowledge_context=None):
 
         errors.append(f"streaming: {streaming_result.get('error')}")
         print(f"Streaming başarısız: {streaming_result.get('error')}")
-        print("Non-streaming LLM deneniyor...")
+        print("Non-streaming LLM deneniyor.")
 
     except Exception as error:
         errors.append(f"streaming exception: {error}")
         print(f"Streaming exception: {error}")
-        print("Non-streaming LLM deneniyor...")
+        print("Non-streaming LLM deneniyor.")
 
     try:
         non_streaming_result = ask_llm_non_streaming(

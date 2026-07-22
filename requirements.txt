@@ -6,3 +6,5 @@ aiortc
 numpy
 faster-whisper
 edge-tts
+qdrant-client
+sentence-transformers
